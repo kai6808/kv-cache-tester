@@ -235,7 +235,8 @@ class TestConfig:
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
     # Rate limiting
-    enable_request_rate_limiting: bool = False
+    ttft_window: int = 3  # Rolling TTFT window (number of periods)
+    rate_limit_backoff: float = 30.0  # Backoff duration when rate limited (seconds)
     # Admission control
     max_concurrent_requests: Optional[int] = None  # None = unlimited
     # Warm prefix for cross-conversation cache sharing
@@ -1654,7 +1655,7 @@ class TestOrchestrator:
         self.period_metrics: List[RequestMetrics] = []
         self.period_new_tokens: int = 0  # Cache miss tokens this period
         self.period_users_added: int = 0  # Users added this period
-        self.period_rate_limit_events: int = 0  # Rate-limit events this period
+        # period_rate_limit_ws and period_rate_limit_ttft are tracked above
         self.peak_working_set_tokens: int = 0  # Track peak working set
         self.peak_users: int = 0  # Track peak concurrent users
 
@@ -1670,11 +1671,12 @@ class TestOrchestrator:
         self.period_admission_blocked: int = 0  # Times dispatch was blocked this period
         self.period_dispatch_delays: List[float] = []  # Dispatch delays this period
 
-        # Cooldown tracking for ramp controller
-        self.consecutive_exceeded_periods: int = 0   # How many consecutive periods exceeded TTFT
-        self.consecutive_good_periods: int = 0       # How many consecutive periods under TTFT
-        self.cooldown_required: int = 0              # Good periods required before next ramp
-        self.post_cooldown_ramps: int = 0            # Ramps since last cooldown (for throttling)
+        # Rolling TTFT window for ramp and rate limiting decisions
+        self.ttft_history: deque = deque(maxlen=self.config.ttft_window)
+
+        # Rate limiting tracking
+        self.period_rate_limit_ws: int = 0    # Users rate limited by working set this period
+        self.period_rate_limit_ttft: int = 0  # Users rate limited by TTFT this period
 
         # Error tracking
         self.consecutive_connection_errors: int = 0
@@ -1907,7 +1909,7 @@ class TestOrchestrator:
         return active, idle
 
     def get_ttft_value(self) -> Optional[float]:
-        """Get the current TTFT value based on configured metric. Returns None if no data."""
+        """Get the current period's TTFT value based on configured metric. Returns None if no data."""
         if not self.period_metrics:
             return None  # No data available
 
@@ -1922,85 +1924,72 @@ class TestOrchestrator:
         else:  # p95
             return np.percentile(ttfts, 95)
 
+    def get_rolling_ttft(self) -> Optional[float]:
+        """Get rolling TTFT average across the configured window of periods.
+        Returns None if no data in any period in the window."""
+        values = [v for v in self.ttft_history if v is not None]
+        if not values:
+            return None
+        return np.mean(values)
+
+    def get_rate_limited_count(self) -> int:
+        """Count users currently in rate_limited state."""
+        return sum(1 for u in self.users.values() if u.state == "rate_limited")
+
+    def predict_user_cache_misses(self, user) -> int:
+        """Predict how many new (cache miss) blocks the user's next request will have."""
+        if user.current_idx >= len(user.requests):
+            return 0
+        req = user.requests[user.current_idx]
+        if req.get('type') == 'subagent':
+            return 0
+        current_hash_ids = set(req.get('hash_ids', []))
+        if not user.prev_hash_ids:
+            return len(current_hash_ids)  # First request = all misses
+        return len(current_hash_ids - user.prev_hash_ids)
+
     def calculate_users_to_add(self) -> int:
         """
         Calculate how many users to add based on TTFT headroom with cooldown gating.
 
-        Uses consecutive good/bad period tracking to prevent ramping after brief
-        recovery from sustained overload. Budget enforcement (per-period and working
-        set) happens in create_user() on a per-trace basis.
+        Uses rolling TTFT window and working set cap to decide when to add users.
+        Stops adding if any users are currently rate limited.
 
         Returns number of users to add (0 if gated by any condition).
         """
-        ttft_value = self.get_ttft_value()
+        rolling_ttft = self.get_rolling_ttft()
 
-        # No data = don't add users (system may be overloaded or starting up)
-        if ttft_value is None:
+        # Gate: any users currently rate limited → don't add more
+        if self.get_rate_limited_count() > 0:
             return 0
 
-        # Over TTFT threshold = don't add
-        if ttft_value >= self.config.max_ttft:
+        # Gate: no TTFT data → don't add (system may be starting up)
+        if rolling_ttft is None:
             return 0
 
-        # Gate: in-flight > 75% of max concurrent
-        if (self.config.max_concurrent_requests and
-            self.in_flight_requests > self.config.max_concurrent_requests * 0.75):
-            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Skipping user addition: in-flight at {self.in_flight_requests}/{self.config.max_concurrent_requests} (>75%){Colors.ENDC}")
+        # Gate: rolling TTFT over threshold → don't add
+        if rolling_ttft >= self.config.max_ttft:
             return 0
 
-        # Gate: cooldown not yet satisfied
-        if self.cooldown_required > 0 and self.consecutive_good_periods < self.cooldown_required:
-            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Cooldown: {self.consecutive_good_periods}/{self.cooldown_required} good periods required before ramp{Colors.ENDC}")
-            return 0
+        # Gate: working set > 90% of cap → don't add
+        if self.config.max_working_set_tokens > 0:
+            current_ws = self.get_current_working_set_tokens()
+            if current_ws > self.config.max_working_set_tokens * 0.9:
+                return 0
 
-        # Cooldown satisfied — reset it
-        if self.cooldown_required > 0:
-            logger.info(f"  \u2713 Cooldown satisfied ({self.consecutive_good_periods} consecutive good periods)")
-            self.cooldown_required = 0
+        # Compute headroom from rolling TTFT
+        headroom_pct = (self.config.max_ttft - rolling_ttft) / self.config.max_ttft * 100
 
         # Gate: minimum headroom of 20%
-        headroom_pct = (self.config.max_ttft - ttft_value) / self.config.max_ttft * 100
         if headroom_pct < 20:
-            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Headroom too low ({headroom_pct:.0f}% < 20% minimum){Colors.ENDC}")
             return 0
 
-        # Throttle after cooldown: first 2 ramps = +1 only
-        self.post_cooldown_ramps += 1
-        if self.post_cooldown_ramps <= 2:
-            return 1
-
-        # Normal ramp: scale by headroom (less aggressive than before)
-        # 1 base + 1 per 15% headroom (e.g., 75% headroom = 1 + 5 = 6 users)
+        # Scale by headroom: 1 base + 1 per 15% headroom
         return max(1, 1 + int(headroom_pct / 15))
 
     def check_thresholds(self) -> bool:
         """Check if performance thresholds are met. Returns True if we can add users."""
         return self.calculate_users_to_add() > 0
-
-    def should_rate_limit_dispatch(self) -> Tuple[bool, float]:
-        """Check if new request dispatch should be rate-limited.
-
-        When TTFT exceeds the configured threshold, we delay dispatching new
-        requests to reduce queue depth in vLLM's scheduler. This allows existing
-        prefills to complete faster, naturally reducing TTFT.
-
-        Returns:
-            (should_limit, backoff_seconds): Whether to rate-limit and how long to wait
-        """
-        if not self.config.enable_request_rate_limiting:
-            return False, 0.0
-
-        ttft_value = self.get_ttft_value()
-        if ttft_value is None:
-            return False, 0.0
-
-        if ttft_value <= self.config.max_ttft:
-            return False, 0.0
-
-        # Calculate backoff proportional to overage (1s base, capped at 10s)
-        overage_ratio = ttft_value / self.config.max_ttft
-        backoff = min(1.0 * overage_ratio, 10.0)
-        return True, backoff
 
     def prune_old_blocks(self, max_age: float = 900):
         """Remove blocks older than max_age seconds. O(k) where k = expired blocks.
@@ -2232,7 +2221,7 @@ class TestOrchestrator:
             new_tokens_ingested=new_tokens,
             ttft_headroom_pct=ttft_headroom_pct,
             rate_limited_users=rate_limited_users,
-            rate_limit_events=self.period_rate_limit_events,
+            rate_limit_events=self.period_rate_limit_ws + self.period_rate_limit_ttft,
             admission_blocked_events=self.period_admission_blocked,
             dispatch_delay_avg=np.mean(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             dispatch_delay_max=max(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
@@ -2538,6 +2527,48 @@ class TestOrchestrator:
                 # Phase 2: Sort by ready_at (fair ordering - longest waiting first)
                 ready_users.sort(key=lambda x: x[2])
 
+                # Phase 2.5: Rate limiting — check triggers and limit most expensive users
+                rolling_ttft = self.get_rolling_ttft()
+                ws_over_cap = (self.config.max_working_set_tokens > 0 and
+                               self.get_current_working_set_tokens() > self.config.max_working_set_tokens)
+                ttft_over = (rolling_ttft is not None and rolling_ttft >= self.config.max_ttft)
+
+                if (ws_over_cap or ttft_over) and ready_users:
+                    # Score each ready user by predicted cache misses (most expensive first)
+                    scored = []
+                    for uid, user, rat in ready_users:
+                        misses = self.predict_user_cache_misses(user)
+                        scored.append((uid, user, rat, misses))
+
+                    # Sort by predicted misses descending (highest cost first)
+                    scored.sort(key=lambda x: -x[3])
+
+                    # Rate limit users from the top until pressure is relieved
+                    remaining = []
+                    for uid, user, rat, misses in scored:
+                        # Check if we still need to rate limit
+                        still_ws_over = (self.config.max_working_set_tokens > 0 and
+                                         self.get_current_working_set_tokens() > self.config.max_working_set_tokens)
+                        still_ttft_over = (rolling_ttft is not None and rolling_ttft >= self.config.max_ttft)
+
+                        if (still_ws_over or still_ttft_over) and misses > 0:
+                            user.state = "rate_limited"
+                            user.rate_limit_until = now + self.config.rate_limit_backoff
+                            user.rate_limit_count += 1
+                            user.total_rate_limit_count += 1
+                            trigger = "working-set" if still_ws_over else "ttft"
+                            if still_ws_over:
+                                self.period_rate_limit_ws += 1
+                            else:
+                                self.period_rate_limit_ttft += 1
+                            logger.info(f"{Colors.WARNING}  ⏱️ {user.user_id} rate-limited "
+                                       f"({trigger}, {misses} predicted miss blocks, "
+                                       f"backoff: {self.config.rate_limit_backoff:.0f}s){Colors.ENDC}")
+                        else:
+                            remaining.append((uid, user, rat))
+
+                    ready_users = remaining
+
                 # Phase 3: Dispatch in fair order, respecting admission limit
                 for user_id, user, ready_at in ready_users:
                     # Admission control check
@@ -2545,23 +2576,6 @@ class TestOrchestrator:
                         self.in_flight_requests >= self.config.max_concurrent_requests):
                         self.period_admission_blocked += 1
                         continue  # At capacity, skip this user
-
-                    # Check if rate-limiting is needed before dispatching
-                    should_limit, backoff = self.should_rate_limit_dispatch()
-                    if should_limit:
-                        # Apply exponential backoff (1.5x per retry)
-                        actual_backoff = backoff * (1.5 ** user.rate_limit_count)
-                        user.state = "rate_limited"
-                        user.rate_limit_until = now + actual_backoff
-                        user.rate_limit_count += 1
-                        user.total_rate_limit_count += 1
-                        self.period_rate_limit_events += 1
-                        logger.info(f"{Colors.WARNING}  ⏱️ {user.user_id} rate-limited "
-                                   f"(backoff: {actual_backoff:.1f}s, attempt #{user.rate_limit_count}){Colors.ENDC}")
-                        continue
-
-                    # Reset rate-limit count on successful dispatch
-                    user.rate_limit_count = 0
 
                     # Track dispatch delay (how far behind schedule)
                     dispatch_delay = now - ready_at
@@ -2631,27 +2645,19 @@ class TestOrchestrator:
                     self.assessment_periods.append(assessment)
                     self.print_assessment(assessment)
 
-                    # Update cooldown tracking based on TTFT
-                    # Skip tracking when no data (e.g., parent waiting for sub-agents)
+                    # Update rolling TTFT history
                     ttft_val = self.get_ttft_value()
-                    if ttft_val is None:
-                        pass  # No requests completed this period, don't affect cooldown state
-                    elif ttft_val < self.config.max_ttft:
-                        self.consecutive_good_periods += 1
-                        self.consecutive_exceeded_periods = 0
-                    else:
-                        self.consecutive_exceeded_periods += 1
-                        self.consecutive_good_periods = 0
-                        # Set cooldown based on severity of distress
-                        if self.consecutive_exceeded_periods >= 10:
-                            self.cooldown_required = 5
-                        elif self.consecutive_exceeded_periods >= 3:
-                            self.cooldown_required = 3
-                        else:
-                            self.cooldown_required = 2
-                        self.post_cooldown_ramps = 0  # Reset throttle counter
+                    self.ttft_history.append(ttft_val)  # None if no data this period
 
-                    # Calculate how many users to add based on headroom and budget
+                    # Log rolling TTFT and rate limiting status
+                    rolling = self.get_rolling_ttft()
+                    rl_count = self.get_rate_limited_count()
+                    if rolling is not None:
+                        logger.info(f"  Rolling TTFT ({self.config.ttft_window}-period): {rolling:.2f}s"
+                                   + (f" | {rl_count} users rate-limited" if rl_count > 0 else "")
+                                   + (f" (ws: {self.period_rate_limit_ws}, ttft: {self.period_rate_limit_ttft})" if rl_count > 0 else ""))
+
+                    # Calculate how many users to add
                     users_to_add = self.calculate_users_to_add()
                     max_to_add = min(users_to_add, self.config.max_users - len(self.users))
                     if max_to_add > 0:
@@ -2664,16 +2670,16 @@ class TestOrchestrator:
                         new_users = len(self.users)
                         old_users = new_users - users_added
                         headroom = assessment.ttft_headroom_pct
-                        cooldown_info = f", cooldown: {self.cooldown_required}" if self.cooldown_required > 0 else ""
-                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}) (headroom: {headroom:.0f}%{cooldown_info}, budget remaining: {self.config.max_new_tokens_per_period - self.period_new_tokens:,} tokens){Colors.ENDC}")
+                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}) (headroom: {headroom:.0f}%){Colors.ENDC}")
 
-                    # Reset period counters - use period_end_time to maintain contiguous periods
+                    # Reset period counters
                     self.current_period_start = period_end_time
-                    self.period_users_added = users_added  # Store for next period's metrics
-                    self.period_new_tokens = 0  # Reset token budget for new period
-                    self.period_rate_limit_events = 0  # Reset rate-limit counter
-                    self.period_admission_blocked = 0  # Reset admission control counter
-                    self.period_dispatch_delays = []  # Reset dispatch delay tracking
+                    self.period_users_added = users_added
+                    self.period_new_tokens = 0
+                    self.period_rate_limit_ws = 0
+                    self.period_rate_limit_ttft = 0
+                    self.period_admission_blocked = 0
+                    self.period_dispatch_delays = []
 
         except KeyboardInterrupt:
             logger.info(f"\n{Colors.WARNING}Test interrupted by user{Colors.ENDC}")
@@ -3074,9 +3080,10 @@ def parse_arguments():
                         help="Override repetition_penalty for generation (e.g., 1.05)")
 
     # Rate limiting
-    parser.add_argument("--enable-request-rate-limiting", action="store_true",
-                        help="Enable request-level rate-limiting when TTFT exceeds threshold "
-                             "(delays new request dispatch with exponential backoff)")
+    parser.add_argument("--ttft-window", type=int, default=3,
+                        help="Rolling TTFT window in periods for ramp and rate limit decisions (default: 3)")
+    parser.add_argument("--rate-limit-backoff", type=float, default=30.0,
+                        help="Backoff duration in seconds when a user is rate limited (default: 30)")
 
     # Admission control
     parser.add_argument("--max-concurrent-requests", type=int, default=50,
@@ -3147,7 +3154,8 @@ async def main():
         top_p=args.top_p,
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
-        enable_request_rate_limiting=args.enable_request_rate_limiting,
+        ttft_window=args.ttft_window,
+        rate_limit_backoff=args.rate_limit_backoff,
         max_concurrent_requests=args.max_concurrent_requests,
         warm_prefix_pct=args.warm_prefix_pct,
         advance_min=args.advance_min,
