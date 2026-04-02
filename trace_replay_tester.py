@@ -2544,28 +2544,40 @@ class TestOrchestrator:
                     scored.sort(key=lambda x: -x[3])
 
                     # Rate limit users from the top until pressure is relieved
+                    # Stagger backoff times to prevent thundering herd on release:
+                    # most expensive users come back last, cheapest first
                     remaining = []
+                    users_to_limit = []
                     for uid, user, rat, misses in scored:
-                        # Check if we still need to rate limit
                         still_ws_over = (self.config.max_working_set_tokens > 0 and
                                          self.get_current_working_set_tokens() > self.config.max_working_set_tokens)
                         still_ttft_over = (rolling_ttft is not None and rolling_ttft >= self.config.max_ttft)
 
                         if (still_ws_over or still_ttft_over) and misses > 0:
-                            user.state = "rate_limited"
-                            user.rate_limit_until = now + self.config.rate_limit_backoff
-                            user.rate_limit_count += 1
-                            user.total_rate_limit_count += 1
                             trigger = "working-set" if still_ws_over else "ttft"
-                            if still_ws_over:
-                                self.period_rate_limit_ws += 1
-                            else:
-                                self.period_rate_limit_ttft += 1
-                            logger.info(f"{Colors.WARNING}  ⏱️ {user.user_id} rate-limited "
-                                       f"({trigger}, {misses} predicted miss blocks, "
-                                       f"backoff: {self.config.rate_limit_backoff:.0f}s){Colors.ENDC}")
+                            users_to_limit.append((uid, user, misses, trigger))
                         else:
                             remaining.append((uid, user, rat))
+
+                    # Apply staggered backoff — cheapest users (end of list) come back first
+                    n = len(users_to_limit)
+                    base_backoff = self.config.rate_limit_backoff
+                    stagger = base_backoff / max(n, 1)  # spread across one backoff window
+                    for i, (uid, user, misses, trigger) in enumerate(users_to_limit):
+                        # Position 0 = most expensive → longest backoff (2x base)
+                        # Position n-1 = cheapest → shortest backoff (1x base)
+                        user_backoff = base_backoff + (i * stagger)
+                        user.state = "rate_limited"
+                        user.rate_limit_until = now + user_backoff
+                        user.rate_limit_count += 1
+                        user.total_rate_limit_count += 1
+                        if trigger == "working-set":
+                            self.period_rate_limit_ws += 1
+                        else:
+                            self.period_rate_limit_ttft += 1
+                        logger.info(f"{Colors.WARNING}  ⏱️ {user.user_id} rate-limited "
+                                   f"({trigger}, {misses} predicted miss blocks, "
+                                   f"backoff: {user_backoff:.0f}s){Colors.ENDC}")
 
                     ready_users = remaining
 
