@@ -1276,8 +1276,13 @@ class UserSession:
                 return
 
         # Store the actual response and track its token count
-        self.conversation.append({"role": "assistant", "content": response_text})
-        self.stored_response_tokens = response_tokens
+        # Skip empty responses — they poison the conversation and cause cascading failures
+        if response_tokens > 0 and response_text:
+            self.conversation.append({"role": "assistant", "content": response_text})
+            self.stored_response_tokens = response_tokens
+        else:
+            # Don't store empty response — fallback may have been injected by retry logic
+            self.stored_response_tokens = 0
 
     def advance(self):
         """Move to next request"""
@@ -1470,6 +1475,52 @@ class UserSession:
             self.conversation.append(self.generator.build_user_message(max(100, current_input_tokens), 'text', seed))
 
         return list(self.conversation), max_tokens
+
+    def regenerate_last_user_message(self, request: dict, retry_num: int) -> List[dict]:
+        """Regenerate the last user message with a different seed.
+
+        Used when the model produces 0 output tokens — the synthetic content
+        likely caused the model to emit an immediate stop token.
+
+        For the first request (current_idx == 0), regenerates the entire message.
+        For later requests, replaces only the last appended user message.
+
+        Returns the updated messages list.
+        """
+        msg_type = self._get_user_message_type(request)
+        current_input_tokens = request.get('input_tokens', 0)
+
+        if self.current_idx == 0:
+            # First request: regenerate entirely
+            self.conversation.clear()
+            seed = hash(f"{self.user_id}_{self.current_idx}_retry{retry_num}_{current_input_tokens}") % (2**32)
+            new_msg = self.generator.build_user_message(current_input_tokens, msg_type, seed)
+            self.conversation.append(new_msg)
+            logger.warning(f"  🔄 {self.user_id} req {self.current_idx}: Regenerating first message (retry {retry_num}, seed={seed})")
+        else:
+            # Later request: remove last user message and regenerate
+            if self.conversation and self.conversation[-1]['role'] == 'user':
+                self.conversation.pop()
+            token_delta = current_input_tokens - self.prev_input_tokens
+            tokens_to_generate = max(100, token_delta)  # At least 100 tokens
+            seed = hash(f"{self.user_id}_{self.current_idx}_retry{retry_num}_{tokens_to_generate}") % (2**32)
+            new_msg = self.generator.build_user_message(tokens_to_generate, msg_type, seed)
+            self.conversation.append(new_msg)
+            logger.warning(f"  🔄 {self.user_id} req {self.current_idx}: Regenerating last user message (retry {retry_num}, seed={seed}, {tokens_to_generate} tokens)")
+
+        max_tokens = max(1, request.get('output_tokens', 100))
+        return list(self.conversation), max_tokens
+
+    def inject_fallback_assistant_response(self):
+        """Inject a minimal assistant response when all retries produce 0 output.
+
+        Prevents conversation from being poisoned with empty assistant turns.
+        """
+        fallback = "I'll help with that. Let me analyze the code and provide a detailed response."
+        self.conversation.append({"role": "assistant", "content": fallback})
+        fallback_tokens = len(self.generator.tokenizer.encode(fallback, add_special_tokens=False))
+        self.stored_response_tokens = fallback_tokens
+        logger.warning(f"  ⚠️ {self.user_id} req {self.current_idx}: Injected fallback assistant response ({fallback_tokens} tokens)")
 
     def record_shortfall(self, expected_tokens: int, actual_tokens: int):
         """Record token shortfall if model generated less than 80% of expected."""
@@ -2475,34 +2526,49 @@ class TestOrchestrator:
         # Calculate expected cache hits
         cache_hits, cache_misses = user.calculate_cache_hits(request)
 
-        # Send request
+        # Send request with retry on zero output tokens
         stream = True  # Always stream for accurate TTFT measurement
         expected_output = request.get('output_tokens', 100)
+        max_zero_retries = 3
 
-        # Track if first token was received (for proper counter management)
-        first_token_received = False
+        for attempt in range(max_zero_retries + 1):
+            # Track if first token was received (for proper counter management)
+            first_token_received = False
 
-        def on_first_token():
-            nonlocal first_token_received
-            first_token_received = True
-            self.in_flight_decoding += 1
+            def on_first_token():
+                nonlocal first_token_received
+                first_token_received = True
+                self.in_flight_decoding += 1
 
-        def on_chunk(chunk_time, chunk_tokens):
-            self.output_token_log.append((chunk_time, chunk_tokens))
+            def on_chunk(chunk_time, chunk_tokens):
+                self.output_token_log.append((chunk_time, chunk_tokens))
 
-        result = await self.api_client.send_request(
-            messages,
-            max_tokens,
-            stream=stream,
-            on_first_token=on_first_token,
-            on_chunk=on_chunk,
-            tokenizer=self.generator.tokenizer
-        )
+            result = await self.api_client.send_request(
+                messages,
+                max_tokens,
+                stream=stream,
+                on_first_token=on_first_token,
+                on_chunk=on_chunk,
+                tokenizer=self.generator.tokenizer
+            )
 
-        # Decrement decode counter if first token was received
-        # (request has moved from decode phase to complete)
-        if first_token_received:
-            self.in_flight_decoding -= 1
+            # Decrement decode counter if first token was received
+            if first_token_received:
+                self.in_flight_decoding -= 1
+
+            # Check if we got zero output on a successful request
+            if (result['error_type'] is None and
+                    result['output_tokens'] == 0 and
+                    attempt < max_zero_retries):
+                # Regenerate prompt with different seed and retry
+                messages, max_tokens = user.regenerate_last_user_message(request, attempt + 1)
+                continue
+            break
+
+        # If all retries produced 0 output, inject fallback assistant response
+        if result['error_type'] is None and result['output_tokens'] == 0:
+            logger.warning(f"  ❌ {user.user_id} req {user.current_idx}: All {max_zero_retries} retries produced 0 output tokens, injecting fallback")
+            user.inject_fallback_assistant_response()
 
         # Unpack result
         response_text = result['response_text']
