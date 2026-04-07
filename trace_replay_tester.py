@@ -1825,15 +1825,9 @@ class TestOrchestrator:
         self.period_rate_limit_ws: int = 0    # Users rate limited by working set this period
         self.period_rate_limit_ttft: int = 0  # Users rate limited by TTFT this period
 
-        # New three-layer rate limiting
+        # Token bucket rate limiting
         self.otpm_bucket: Optional[TokenBucket] = None
         self.itpm_bucket: Optional[TokenBucket] = None
-        self.use_new_rate_limiting: bool = (
-            config.max_prefill_concurrent > 0 or
-            config.max_decode_concurrent > 0 or
-            config.otpm_budget > 0 or
-            config.itpm_budget > 0
-        )
         # Initialize token buckets
         if config.otpm_budget > 0:
             self.otpm_bucket = TokenBucket(
@@ -2474,7 +2468,7 @@ class TestOrchestrator:
 
 
         # Show admission control metrics if enabled
-        if self.config.max_concurrent_requests or self.use_new_rate_limiting:
+        if self.config.max_concurrent_requests or True:
             total_in_flight = metrics.in_flight_prefilling + metrics.in_flight_decoding
             logger.info(f"  Admission Control: {total_in_flight} in-flight "
                        f"({metrics.in_flight_prefilling} prefilling, {metrics.in_flight_decoding} decoding) | "
@@ -2768,13 +2762,14 @@ class TestOrchestrator:
                 # Phase 2: Sort by ready_at (fair ordering - longest waiting first)
                 ready_users.sort(key=lambda x: x[2])
 
-                if self.use_new_rate_limiting:
+                if True:
                     # ============================================================
-                    # NEW TWO-LAYER RATE LIMITING
+                    # TWO-LAYER RATE LIMITING
                     # ============================================================
                     # Working set cap only controls user ramp (in calculate_users_to_add).
                     # Dispatch-level admission is handled by Layer 1 (concurrency)
                     # and Layer 2 (token budgets).
+                    # When no Layer 1/2 flags are set, requests dispatch freely.
 
                     for user_id, user, ready_at in ready_users:
                         # --- Layer 1: Inference admission (hardware guard rails) ---
@@ -2836,63 +2831,6 @@ class TestOrchestrator:
                             self.otpm_bucket.tokens -= otpm_cost
 
                         # --- All checks passed: DISPATCH ---
-                        dispatch_delay = now - ready_at
-                        self.period_dispatch_delays.append(dispatch_delay)
-                        self.in_flight_requests += 1
-                        task = asyncio.create_task(self.run_user_request(user, queue_time=dispatch_delay))
-                        pending_tasks[task] = (user_id, now)
-
-                else:
-                    # ============================================================
-                    # LEGACY RATE LIMITING (backward compatibility)
-                    # ============================================================
-                    rolling_ttft = self.get_rolling_ttft()
-                    ws_over_cap = (self.config.max_working_set_tokens > 0 and
-                                   self.get_current_working_set_tokens() > self.config.max_working_set_tokens)
-                    ttft_over = (rolling_ttft is not None and rolling_ttft >= self.config.max_ttft)
-
-                    if (ws_over_cap or ttft_over) and ready_users:
-                        scored = []
-                        for uid, user, rat in ready_users:
-                            misses = self.predict_user_cache_misses(user)
-                            scored.append((uid, user, rat, misses))
-                        scored.sort(key=lambda x: -x[3])
-
-                        if ws_over_cap:
-                            target_limit = max(1, len(scored) // 4)
-                        elif ttft_over:
-                            overage_pct = (rolling_ttft - self.config.max_ttft) / self.config.max_ttft
-                            target_limit = max(1, int(len(scored) * min(overage_pct, 0.5)))
-                        else:
-                            target_limit = 0
-
-                        remaining = []
-                        limited = 0
-                        import random
-                        base_backoff = self.config.rate_limit_backoff
-                        for uid, user, rat, misses in scored:
-                            if limited < target_limit and misses > 0:
-                                jitter = random.uniform(0, base_backoff * 0.5)
-                                user_backoff = base_backoff + jitter
-                                user.state = "rate_limited"
-                                user.rate_limit_until = now + user_backoff
-                                user.rate_limit_count += 1
-                                user.total_rate_limit_count += 1
-                                if ws_over_cap:
-                                    self.period_rate_limit_ws += 1
-                                else:
-                                    self.period_rate_limit_ttft += 1
-                                limited += 1
-                            else:
-                                remaining.append((uid, user, rat))
-                        ready_users = remaining
-
-                    # Phase 3: Dispatch (legacy)
-                    for user_id, user, ready_at in ready_users:
-                        if (self.config.max_concurrent_requests and
-                                self.in_flight_requests >= self.config.max_concurrent_requests):
-                            self.period_admission_blocked += 1
-                            continue
                         dispatch_delay = now - ready_at
                         self.period_dispatch_delays.append(dispatch_delay)
                         self.in_flight_requests += 1
