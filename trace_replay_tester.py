@@ -3424,10 +3424,11 @@ def parse_arguments():
                         help="Backoff duration in seconds when a user is rate limited (default: 30)")
 
     # Admission control (legacy)
-    parser.add_argument("--max-concurrent-requests", type=int, default=50,
+    parser.add_argument("--max-concurrent-requests", type=int, default=0,
                         help="Max concurrent in-flight requests (admission control). "
                              "When reached, new dispatches are blocked until requests complete. "
-                             "Default: 50. Set to 0 to disable.")
+                             "Default: 0 (disabled). Use --max-prefill-concurrent and "
+                             "--max-decode-concurrent for fine-grained control.")
 
     # --- New three-layer rate limiting ---
     # Layer 1: Inference admission
