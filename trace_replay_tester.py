@@ -269,7 +269,8 @@ class TestConfig:
     min_requests: int = 1
     max_new_tokens_per_period: int = 500000  # Cache pressure limit per period
     max_working_set_tokens: int = 0  # 0 = unlimited, else cap total working set
-    seed: Optional[int] = None  # Random seed for reproducibility
+    trace_selection_seed: Optional[int] = None  # Seed for trace shuffle/pick order; None = fresh random each run
+    prompt_generation_seed: Optional[int] = None  # Seed for synthetic prompt content + warm prefix; None = fresh random each run
     # Generation parameters (None = use model defaults or auto-detect)
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -517,11 +518,11 @@ def normalize_trace(trace: dict) -> dict:
 class TraceManager:
     """Manages loading and sampling of conversation traces"""
 
-    def __init__(self, trace_dir: Path, max_context: int, min_requests: int = 1, seed: Optional[int] = None):
+    def __init__(self, trace_dir: Path, max_context: int, min_requests: int = 1, trace_selection_seed: Optional[int] = None):
         self.trace_dir = trace_dir
         self.max_context = max_context
         self.min_requests = min_requests
-        self.seed = seed
+        self.trace_selection_seed = trace_selection_seed
         self.traces: List[dict] = []
         self.used_trace_ids: Set[str] = set()
         self.stats: Optional[TraceStats] = None
@@ -531,8 +532,9 @@ class TraceManager:
         self.available_ids: Set[str] = set()  # Currently available trace IDs
         self.next_idx: int = 0  # Counter for round-robin selection
 
-        # Use dedicated RNG for deterministic behavior (isolated from global state)
-        self.rng = random.Random(seed) if seed is not None else random.Random()
+        # Dedicated RNG for trace selection only. If seed is None, draws fresh entropy
+        # from the OS so each run picks a different trace order by default.
+        self.rng = random.Random(trace_selection_seed) if trace_selection_seed is not None else random.Random()
 
     def load_traces(self) -> int:
         """Load all traces from directory and filter by max_context"""
@@ -671,10 +673,17 @@ class SyntheticMessageGenerator:
     - Tool results: File contents, bash output, paths, errors
     """
 
-    def __init__(self, tokenizer_id: str, chunk_size: int = 64):
+    def __init__(self, tokenizer_id: str, chunk_size: int = 64, prompt_generation_seed: Optional[int] = None):
         self.tokenizer = None
         self.tokenizer_id = tokenizer_id
         self.chunk_size = chunk_size
+
+        # Master seed controlling all synthetic prompt content (pools, per-user prompts,
+        # canonical warm prefix). None = fresh random each run so default behaviour is
+        # "never reproducible unless the user asks for it". Drawn once at construction.
+        if prompt_generation_seed is None:
+            prompt_generation_seed = random.SystemRandom().randint(0, 2**32 - 1)
+        self.prompt_generation_seed = prompt_generation_seed
 
         # Separate content pools for different message types
         self._user_text_pool_tokens: Optional[List[int]] = None
@@ -845,7 +854,7 @@ class SyntheticMessageGenerator:
         topic_weights = np.array([TOPICS[t]["weight"] for t in topic_names])
         topic_weights = topic_weights / topic_weights.sum()  # normalize
 
-        np.random.seed(42)
+        np.random.seed(self.prompt_generation_seed)
         chunks = []
         estimated_tokens = 0
         target_tokens = self._pool_size + 100_000
@@ -894,7 +903,7 @@ class SyntheticMessageGenerator:
         for t in TOPICS.values():
             all_topic_nouns.extend(t["nouns"])
 
-        np.random.seed(43)  # Different seed for different content
+        np.random.seed((self.prompt_generation_seed + 1) % (2**32))  # Offset so pools differ
         chunks = []
         estimated_tokens = 0
         target_tokens = self._pool_size + 100_000
@@ -3411,7 +3420,11 @@ def parse_arguments():
     parser.add_argument("--skip-graphs", action="store_true",
                         help="Skip graph generation")
     parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed for reproducible trace selection")
+                        help="Random seed for both trace selection and prompt generation (convenience; overridden by --trace-seed / --prompt-seed)")
+    parser.add_argument("--trace-seed", type=int, default=None,
+                        help="Seed for trace shuffle/pick order (overrides --seed for trace selection)")
+    parser.add_argument("--prompt-seed", type=int, default=None,
+                        help="Seed for synthetic prompt content and warm prefix (overrides --seed for prompt generation)")
 
     # Generation parameter overrides (None = use model-specific defaults if available)
     parser.add_argument("--temperature", type=float, default=None,
@@ -3523,7 +3536,8 @@ async def main():
         min_requests=args.min_requests,
         max_new_tokens_per_period=args.max_new_tokens_per_period,
         max_working_set_tokens=args.max_working_set_tokens,
-        seed=args.seed,
+        trace_selection_seed=args.trace_seed if args.trace_seed is not None else args.seed,
+        prompt_generation_seed=args.prompt_seed if args.prompt_seed is not None else args.seed,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
@@ -3551,7 +3565,7 @@ async def main():
     logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
 
     # Load traces
-    trace_manager = TraceManager(Path(config.trace_directory), config.max_context, config.min_requests, config.seed)
+    trace_manager = TraceManager(Path(config.trace_directory), config.max_context, config.min_requests, config.trace_selection_seed)
     num_traces = trace_manager.load_traces()
 
     if num_traces == 0:
@@ -3623,7 +3637,7 @@ async def main():
     logger.info(f"{Colors.HEADER}{'=' * 120}{Colors.ENDC}")
 
     # Initialize components
-    generator = SyntheticMessageGenerator(config.tokenizer_id, config.chunk_size)
+    generator = SyntheticMessageGenerator(config.tokenizer_id, config.chunk_size, config.prompt_generation_seed)
     api_client = APIClient(
         config.api_endpoint,
         temperature=config.temperature,
