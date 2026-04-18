@@ -2984,6 +2984,37 @@ class TestOrchestrator:
             logger.info(f"  Warm Prefix: {self.canonical_prefix_tokens:,} tokens ({self.config.warm_prefix_pct:.0%} of max tool+system)")
         if self.total_connection_errors > 0:
             logger.info(f"  {Colors.WARNING}Connection Errors: {self.total_connection_errors}{Colors.ENDC}")
+
+        # SLO / goodput summary across all completed requests
+        successful = [m for m in self.all_metrics if m.success and m.ttft > 0]
+        if successful:
+            slo_ttft = self.config.slo_ttft
+            slo_decode = self.config.slo_decode_tps
+
+            def _decode_ok(m):
+                decode_time = m.ttlt - m.ttft
+                if decode_time <= 0.1:
+                    return True
+                return (m.output_tokens_actual / decode_time) >= slo_decode
+
+            ttft_met = sum(1 for m in successful if m.ttft <= slo_ttft)
+            decode_met = sum(1 for m in successful if _decode_ok(m))
+            both_met = sum(1 for m in successful if m.ttft <= slo_ttft and _decode_ok(m))
+            eff_ttft_met = sum(1 for m in successful if m.effective_ttft <= slo_ttft)
+            eff_both_met = sum(1 for m in successful if m.effective_ttft <= slo_ttft and _decode_ok(m))
+            n = len(successful)
+
+            logger.info(f"")
+            logger.info(f"  SLO Compliance (TTFT ≤ {slo_ttft}s, Decode ≥ {slo_decode} tok/s):")
+            logger.info(f"    TTFT met:           {ttft_met}/{n} ({ttft_met/n*100:.1f}%)")
+            logger.info(f"    Decode met:         {decode_met}/{n} ({decode_met/n*100:.1f}%)")
+            logger.info(f"    Goodput (both):     {both_met}/{n} ({both_met/n*100:.1f}%)")
+            logger.info(f"    Effective TTFT met: {eff_ttft_met}/{n} ({eff_ttft_met/n*100:.1f}%)  (includes queue time)")
+            logger.info(f"    Effective goodput:  {eff_both_met}/{n} ({eff_both_met/n*100:.1f}%)")
+
+            total_rl_events = sum(u.total_rate_limit_count for u in self.users.values())
+            if total_rl_events > 0:
+                logger.info(f"  Rate-limit events: {total_rl_events} total across {self.user_counter} users created")
         logger.info(f"")
         logger.info(f"{Colors.SUCCESS}Results saved to: {self.config.output_dir}{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
