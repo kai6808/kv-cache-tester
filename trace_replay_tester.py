@@ -2448,7 +2448,10 @@ class TestOrchestrator:
             logger.info(f"  {metric_name}: {measured_ttft:.2f}s {threshold_status} (threshold: {self.config.max_ttft}s, headroom: {metrics.ttft_headroom_pct:.0f}%)")
         has_prefill_data = len(self.period_metrics) > 0
         input_tps_str = f"{metrics.input_tokens_per_second:,.0f} input tok/s" if has_prefill_data else "⏳ No data input tok/s"
-        logger.info(f"  Throughput: {input_tps_str} | {metrics.output_tokens_per_second:,.0f} output tok/s")
+        # Output tok/s is measured from live decode chunks; 0 means no chunks
+        # observed in the window (no decode activity), which is the same as no data.
+        output_tps_str = f"{metrics.output_tokens_per_second:,.0f} output tok/s" if metrics.output_tokens_per_second > 0 else "⏳ No data output tok/s"
+        logger.info(f"  Throughput: {input_tps_str} | {output_tps_str}")
         cache_str = f"{metrics.avg_cache_hit_rate:.1%}" if has_prefill_data else "⏳ No data"
         logger.info(f"  Workload Cache Hit Rate: {cache_str} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
 
