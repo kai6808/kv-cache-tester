@@ -1894,8 +1894,17 @@ class TestOrchestrator:
         # Apply trace advancement if configured and allowed for this user
         advancement_pct = 0.0
         if self.config.advance_max > 0 and advance:
+            # Use a deterministic per-user RNG so advancement is reproducible
+            # across runs regardless of call-order timing. Derived from
+            # trace_selection_seed so --seed alone controls reproducibility.
+            # Note: Python's built-in hash() is randomized per-process, so we
+            # use hashlib for a stable per-user seed.
+            import hashlib
+            seed_base = self.config.trace_selection_seed if self.config.trace_selection_seed is not None else 0
+            user_hash = int(hashlib.sha256(user_id.encode()).hexdigest()[:8], 16)
+            advance_rng = random.Random(seed_base ^ user_hash)
             start_idx = calculate_start_index(
-                trace['requests'], self.trace_manager.rng,
+                trace['requests'], advance_rng,
                 self.config.advance_min, self.config.advance_max,
                 self.config.max_context)
             start_idx = skip_subagent_markers(trace['requests'], start_idx)
