@@ -56,7 +56,7 @@ uv run python trace_replay_tester.py \
 
 ### Included Traces
 
-The `traces/` directory contains **739 curated agentic coding traces** with **59,204 requests**, including 19 traces with nested sub-agent conversations (70 sub-agents total). Generated from real Claude Code sessions captured via [claude-code-proxy](https://github.com/seifghazi/claude-code-proxy) as part of research at [WEKA](https://www.weka.io/) on the [Augmented Memory Grid](https://www.weka.io/resources/solution-brief/weka-augmented-memory-grid/) product. See [agentic-coding-analysis](https://github.com/callanjfox/agentic-coding-analysis) for the trace generation tools.
+The `traces/` directory contains **739 traces** with **59,204 requests**, including 19 traces with nested sub-agent conversations (70 sub-agents total). Generated from real Claude Code sessions captured via [claude-code-proxy](https://github.com/seifghazi/claude-code-proxy) as part of research at [WEKA](https://www.weka.io/) on the [Augmented Memory Grid](https://www.weka.io/resources/solution-brief/weka-augmented-memory-grid/) product. See [agentic-coding-analysis](https://github.com/callanjfox/agentic-coding-analysis) for the trace generation tools.
 
 Traces include:
 - **Local hash_ids** (`hash_id_scope: "local"`) — hash IDs are scoped per conversation, with sub-agents sharing the parent's namespace
@@ -64,7 +64,7 @@ Traces include:
 - **Sub-agent nesting** — sub-agents embedded in parent traces with their own tool/system tokens and request arrays
 - **One request per turn** — no streaming/non-streaming pairing (proxy bug fixed upstream)
 
-All traces are fully anonymized — no conversation IDs, timestamps, or real agent IDs. Traces are curated from a larger set of 1,888 conversations: single-request conversations, conversations exceeding 900K input tokens, conversations with <60% cache hit rate, and conversations with frequent context compaction (pullbacks >5% of requests) are excluded.
+All traces are fully anonymized — no conversation IDs, timestamps, or real agent IDs.
 
 | Metric | Min | P25 | Median | P75 | Max | Mean |
 |---|---|---|---|---|---|---|
