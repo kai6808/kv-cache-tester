@@ -204,7 +204,12 @@ The summary printed at the end of a test includes an SLO compliance breakdown ba
 - **Effective TTFT met**: requests where (queue_time + TTFT) ≤ threshold — captures user-experienced latency including admission queue
 - **Effective goodput**: requests meeting both effective TTFT and decode SLOs
 
-A per-period log line `Users: N total (X active, Y idle, Z rate-limited, W ran requests)` shows the full user state breakdown summing to the total user count. When no requests complete prefill in a period, input tokens/s and cache hit rate display `⏳ No data` rather than `0` to distinguish "no signal" from "genuinely zero".
+A per-period log line `Users: N total (X active, Y idle, Z rate-limited)` shows the user state breakdown summing to the total. Categories are mutually exclusive with priority rate-limited > active > idle:
+- **Rate-limited**: user was rate-limited at any point during this period
+- **Active**: had a request complete or is currently in-flight this period
+- **Idle**: everything else
+
+When no requests complete prefill in a period, input tokens/s, output tokens/s, and cache hit rate display `⏳ No data` rather than `0` to distinguish "no signal" from "genuinely zero".
 
 ## Trace Format
 
