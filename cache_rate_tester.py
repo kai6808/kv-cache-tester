@@ -520,6 +520,9 @@ class TokenizerManager:
         # get_unique_tokens(). Built lazily/once via ensure_unique_pool().
         self._unique_pool_tokens: Optional[List[int]] = None
         self._unique_pool_size = 0
+        # Whether decode(a)+decode(b) == decode(a+b) for this tokenizer; decided once
+        # (lazily) and used to enable prefix-decode caching in construct_prompt.
+        self._decode_concat_safe: Optional[bool] = None
         self._load_tokenizer()
 
     def _load_tokenizer(self):
@@ -663,6 +666,29 @@ class TokenizerManager:
         tokens = marker + pool[offset:offset + num_tokens]
         return tokens[:num_tokens]
 
+    def decode_is_concat_safe(self) -> bool:
+        """Whether decode(a) + decode(b) == decode(a + b) for this tokenizer.
+
+        When true, construct_prompt can decode a cached prefix once and only decode
+        the per-request suffix, instead of decoding the full context every request.
+        Decided once using realistic content (chunk-aligned prefix + REQ-marker suffix,
+        the exact shape construct_prompt builds). Falls back to full decode if unsafe.
+        """
+        if self._decode_concat_safe is None:
+            sample = self.generate_dummy_tokens(2048, seed=0)
+            ok = True
+            for split in (256, 512, 1024):
+                a = sample[:split]
+                b = self.encode("REQ0 ") + sample[split:1500]
+                if self.decode(a) + self.decode(b) != self.decode(a + b):
+                    ok = False
+                    break
+            self._decode_concat_safe = ok
+            if not ok:
+                logger.warning("Tokenizer decode is not concatenation-safe; "
+                               "prefix-decode caching disabled (using full decode per request)")
+        return self._decode_concat_safe
+
 
 class WorkingSet:
     """Manages the working set of pre-warmed prompts"""
@@ -697,6 +723,34 @@ class WorkingSet:
 
         self.prompts: List[List[int]] = []
         self.current_index = 0
+
+        # Decoded-text caches so repeated requests don't re-decode the same tokens.
+        # _decoded_full: full prompt text per index (100% cache path).
+        # _decoded_prefix: prefix text per index for the current prefix length (mixed
+        # path); auto-cleared when the prefix length changes (i.e. between cache-rate
+        # phases) so memory stays bounded to num_prompts entries.
+        self._decoded_full: Dict[int, str] = {}
+        self._decoded_prefix: Dict[int, str] = {}
+        self._decoded_prefix_len: int = -1
+
+    def get_decoded_prompt(self, idx: int) -> str:
+        """Decoded text of a full working-set prompt, cached per index."""
+        if idx not in self._decoded_full:
+            self._decoded_full[idx] = self.tokenizer.decode(self.prompts[idx])
+        return self._decoded_full[idx]
+
+    def get_decoded_prefix(self, idx: int, length: int) -> str:
+        """Decoded text of a working-set prompt prefix, cached per index.
+
+        Only one prefix length is held at a time (cache_hit_rate is fixed within a
+        phase), so changing length clears the cache to bound memory.
+        """
+        if length != self._decoded_prefix_len:
+            self._decoded_prefix.clear()
+            self._decoded_prefix_len = length
+        if idx not in self._decoded_prefix:
+            self._decoded_prefix[idx] = self.tokenizer.decode(self.prompts[idx][:length])
+        return self._decoded_prefix[idx]
 
     def generate_prompts(self):
         """Generate all working set prompts"""
@@ -1319,25 +1373,38 @@ def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
         else:
             return working_set.get_next_prompt(random_selection)
 
+    # Decode caching: when the tokenizer's decode is concatenation-safe, decode the
+    # reused (cached-prefix / full working-set) portion once and only decode the
+    # per-request unique part — avoids re-decoding the full context every request.
+    decode_split = tokenizer.decode_is_concat_safe()
+
     if cache_hit_rate == 0:
         # 0% cache: all unique tokens, no session pinning needed.
         # Slice from the pre-generated pool (with a seed-unique leading chunk) instead
         # of regenerating per request; the unique prefix guarantees a cache miss.
+        # Genuinely unique every request, so there is nothing to cache the decode of.
         tokens = tokenizer.get_unique_tokens(context_size, seed=request_seed)
+        prompt_text = tokenizer.decode(tokens)
     elif cache_hit_rate == 100:
-        # 100% cache: use complete working set prompt (already rounded)
-        tokens, session_id = get_prompt()
+        # 100% cache: use complete working set prompt (already rounded).
+        # The same few working-set prompts repeat, so decode each once and reuse.
+        _, session_id = get_prompt()
+        if decode_split:
+            prompt_text = working_set.get_decoded_prompt(session_id)
+        else:
+            prompt_text = tokenizer.decode(working_set.prompts[session_id])
     else:
         # Mixed: cache prefix + unique suffix. The suffix's seed-unique leading chunk
         # forces divergence right at the cached boundary, so the cached region is
         # exactly `cached_tokens` (no accidental full-prompt cache hits).
         base_prompt, session_id = get_prompt()
-        cached_prefix = base_prompt[:cached_tokens]
         unique_suffix = tokenizer.get_unique_tokens(unique_tokens, seed=request_seed)
-        tokens = cached_prefix + unique_suffix
-
-    # Convert to text
-    prompt_text = tokenizer.decode(tokens)
+        if decode_split:
+            # Decode the shared prefix once (cached per index), suffix per request.
+            prompt_text = (working_set.get_decoded_prefix(session_id, cached_tokens)
+                           + tokenizer.decode(unique_suffix))
+        else:
+            prompt_text = tokenizer.decode(base_prompt[:cached_tokens] + unique_suffix)
 
     # Append a question from the bank to encourage long responses
     # Rotate through questions using question_index
