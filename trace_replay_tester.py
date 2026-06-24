@@ -564,7 +564,8 @@ class TraceManager:
                 parent_requests = [r for r in trace['requests'] if r.get('type') != 'subagent']
                 if not parent_requests:
                     continue
-                first_input = parent_requests[0]['input_tokens']
+                # first_input = parent_requests[0]['input_tokens']
+                first_input = max(r['input_tokens'] for r in parent_requests) # filter by largest input token count in parent requests
                 num_requests = len(parent_requests)
                 # Allow if first request fits and has enough requests
                 if first_input <= self.max_context and num_requests >= self.min_requests:
