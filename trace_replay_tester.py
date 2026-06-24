@@ -3554,6 +3554,182 @@ def generate_graphs(orchestrator: TestOrchestrator, config: TestConfig):
         logger.info("Generated: trace_replay_rate_limiting.html")
 
 
+def generate_server_metrics_graphs(orchestrator: TestOrchestrator, config: TestConfig):
+    """Generate interactive Plotly graphs from the server-side /metrics snapshots
+    (vLLM + LMCache). Only runs with --server-metrics; produces three pages that
+    are linked from index.html beneath the existing trace-replay graphs.
+
+    Counters are cumulative, so every series is reported as a delta against the
+    baseline (first) snapshot — i.e. "since test start". Gauges are point-in-time.
+    """
+    snaps = orchestrator.server_metric_snapshots
+    if len(snaps) < 2:
+        logger.warning("Server metrics: need >=2 snapshots to graph (skipping)")
+        return
+
+    output_path = Path(config.output_dir)
+    model = orchestrator.api_client.model
+
+    base_c = snaps[0]["counters"]
+    base_s = snaps[0]["sources"]
+    pts = snaps[1:]  # baseline excluded from the plotted series
+    xs = [s["elapsed"] for s in pts]
+
+    def cdelta(key):
+        return [s["counters"][key] - base_c[key] for s in pts]
+
+    def sdelta(label):
+        return [s["sources"][label] - base_s[label] for s in pts]
+
+    def gval(key):
+        return [s["gauges"][key] for s in pts]
+
+    def ratio(num, den):
+        return [(n / d * 100.0) if d > 0 else 0.0 for n, d in zip(num, den)]
+
+    def cmean(sum_key, count_key):
+        sums, counts = cdelta(sum_key), cdelta(count_key)
+        return [(s / c) if c > 0 else 0.0 for s, c in zip(sums, counts)]
+
+    # ------------------------------------------------------------------ #
+    # Page 1: Cache hit breakdown (GPU vs CPU vs fresh compute)
+    # ------------------------------------------------------------------ #
+    prompt_total = cdelta("vllm:prompt_tokens_total")
+    gpu_tok = sdelta("local_cache_hit")
+    cpu_tok = sdelta("external_kv_transfer")
+    fresh_tok = sdelta("local_compute")
+
+    figh = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        subplot_titles=('Prompt Tokens by Source (cumulative)', 'Hit Rate Over Time'),
+        vertical_spacing=0.12
+    )
+    figh.add_trace(go.Scatter(x=xs, y=fresh_tok, name='Computed fresh', mode='lines',
+                              stackgroup='src', line=dict(color='#e74c3c')), row=1, col=1)
+    figh.add_trace(go.Scatter(x=xs, y=gpu_tok, name='GPU prefix hit', mode='lines',
+                              stackgroup='src', line=dict(color='#27ae60')), row=1, col=1)
+    figh.add_trace(go.Scatter(x=xs, y=cpu_tok, name='LMCache CPU hit', mode='lines',
+                              stackgroup='src', line=dict(color='#3498db')), row=1, col=1)
+
+    figh.add_trace(go.Scatter(x=xs, y=ratio(cdelta("vllm:prompt_tokens_cached_total"), prompt_total),
+                              name='Cached total % (GPU+CPU)', mode='lines+markers',
+                              line=dict(color='#2c3e50', width=3)), row=2, col=1)
+    figh.add_trace(go.Scatter(x=xs, y=ratio(gpu_tok, prompt_total),
+                              name='GPU prefix hit %', mode='lines+markers',
+                              line=dict(color='#27ae60')), row=2, col=1)
+    figh.add_trace(go.Scatter(x=xs, y=ratio(cpu_tok, prompt_total),
+                              name='LMCache CPU hit %', mode='lines+markers',
+                              line=dict(color='#3498db')), row=2, col=1)
+    figh.add_trace(go.Scatter(x=xs, y=ratio(cdelta("lmcache:num_lookup_hits_total"),
+                                            cdelta("lmcache:num_lookup_tokens_total")),
+                              name='LMCache lookup hit %', mode='lines+markers',
+                              line=dict(color='#9b59b6', dash='dot')), row=2, col=1)
+    figh.add_trace(go.Scatter(x=xs, y=ratio(cdelta("vllm:external_prefix_cache_hits_total"),
+                                            cdelta("vllm:external_prefix_cache_queries_total")),
+                              name='vLLM ext-prefix hit % (of GPU misses)', mode='lines+markers',
+                              line=dict(color='#e67e22', dash='dot')), row=2, col=1)
+
+    # Reference: real per-request cached fraction from vLLM usage (step 2 signal)
+    ct = sum(m.cached_tokens for m in orchestrator.all_metrics
+             if m.cached_tokens is not None)
+    pt = sum(m.server_prompt_tokens for m in orchestrator.all_metrics
+             if m.server_prompt_tokens)
+    if pt > 0:
+        figh.add_hline(y=ct / pt * 100.0, line_dash="dash", line_color="gray",
+                       annotation_text=f"Per-request usage cached: {ct/pt:.1%}", row=2, col=1)
+
+    figh.update_layout(
+        title=f'Cache Hit Breakdown (GPU vs CPU vs Compute)<br><sub>Model: {model}</sub>',
+        height=700, showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis2=dict(title='Elapsed (s)')
+    )
+    figh.update_yaxes(title_text='Tokens', row=1, col=1)
+    figh.update_yaxes(title_text='Hit rate (%)', range=[0, 100], row=2, col=1)
+    figh.write_html(output_path / "server_cache_hit_breakdown.html")
+    logger.info("Generated: server_cache_hit_breakdown.html")
+
+    # ------------------------------------------------------------------ #
+    # Page 2: LMCache eviction & memory
+    # ------------------------------------------------------------------ #
+    fige = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        subplot_titles=('CPU Eviction Activity (cumulative)', 'CPU Pool State (point-in-time)'),
+        vertical_spacing=0.12, specs=[[{"secondary_y": False}], [{"secondary_y": True}]]
+    )
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_count_total"),
+                              name='Evictions', mode='lines+markers', line=dict(color='#e74c3c')), row=1, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_keys_count_total"),
+                              name='Evicted keys', mode='lines+markers', line=dict(color='#e67e22')), row=1, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_failed_count_total"),
+                              name='Evict failures', mode='lines+markers', line=dict(color='#c0392b', dash='dash')), row=1, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:forced_unpin_count_total"),
+                              name='Forced unpins', mode='lines+markers', line=dict(color='#8e44ad', dash='dash')), row=1, col=1)
+
+    fige.add_trace(go.Scatter(x=xs, y=[v / 1e9 for v in gval("lmcache:local_cache_usage")],
+                              name='CPU pool usage (GB)', mode='lines+markers',
+                              fill='tozeroy', line=dict(color='#3498db')), row=2, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=gval("lmcache:active_memory_objs_count"),
+                              name='Active objs', mode='lines+markers', line=dict(color='#16a085')),
+                   row=2, col=1, secondary_y=True)
+    fige.add_trace(go.Scatter(x=xs, y=gval("lmcache:pinned_memory_objs_count"),
+                              name='Pinned objs', mode='lines+markers', line=dict(color='#95a5a6', dash='dot')),
+                   row=2, col=1, secondary_y=True)
+
+    fige.update_layout(
+        title=f'LMCache Eviction & Memory<br><sub>Model: {model} | policy: {os.environ.get("LMCACHE_CACHE_POLICY", "?")}</sub>',
+        height=700, showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis2=dict(title='Elapsed (s)')
+    )
+    fige.update_yaxes(title_text='Count', row=1, col=1)
+    fige.update_yaxes(title_text='Usage (GB)', row=2, col=1, secondary_y=False)
+    fige.update_yaxes(title_text='Objects', row=2, col=1, secondary_y=True)
+    fige.write_html(output_path / "server_lmcache_eviction.html")
+    logger.info("Generated: server_lmcache_eviction.html")
+
+    # ------------------------------------------------------------------ #
+    # Page 3: LMCache load / store (incl. re-store thrash signal)
+    # ------------------------------------------------------------------ #
+    figl = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        subplot_titles=('Tokens Stored vs Served (cumulative)',
+                        'Store / Retrieve Requests (cumulative)',
+                        'Mean Stage Latency (cumulative)'),
+        vertical_spacing=0.08
+    )
+    figl.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:num_stored_tokens_total"),
+                              name='Stored tokens (incl. re-stores)', mode='lines+markers',
+                              line=dict(color='#e67e22')), row=1, col=1)
+    figl.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:num_hit_tokens_total"),
+                              name='Served (hit) tokens', mode='lines+markers',
+                              line=dict(color='#27ae60')), row=1, col=1)
+
+    figl.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:num_store_requests_total"),
+                              name='Store requests', mode='lines+markers', line=dict(color='#e74c3c')), row=2, col=1)
+    figl.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:num_retrieve_requests_total"),
+                              name='Retrieve requests', mode='lines+markers', line=dict(color='#3498db')), row=2, col=1)
+
+    figl.add_trace(go.Scatter(x=xs, y=cmean("lmcache:time_to_store_sum", "lmcache:time_to_store_count"),
+                              name='time_to_store', mode='lines+markers', line=dict(color='#e67e22')), row=3, col=1)
+    figl.add_trace(go.Scatter(x=xs, y=cmean("lmcache:time_to_retrieve_sum", "lmcache:time_to_retrieve_count"),
+                              name='time_to_retrieve', mode='lines+markers', line=dict(color='#3498db')), row=3, col=1)
+    figl.add_trace(go.Scatter(x=xs, y=cmean("lmcache:time_to_lookup_sum", "lmcache:time_to_lookup_count"),
+                              name='time_to_lookup', mode='lines+markers', line=dict(color='#9b59b6')), row=3, col=1)
+
+    figl.update_layout(
+        title=f'LMCache Load / Store<br><sub>Model: {model}</sub>',
+        height=900, showlegend=True, template='plotly_white',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    figl.update_yaxes(title_text='Tokens', row=1, col=1)
+    figl.update_yaxes(title_text='Requests', row=2, col=1)
+    figl.update_yaxes(title_text='Seconds', row=3, col=1)
+    figl.update_xaxes(title_text='Elapsed (s)', row=3, col=1)
+    figl.write_html(output_path / "server_lmcache_load_store.html")
+    logger.info("Generated: server_lmcache_load_store.html")
+
+
 def save_results(orchestrator: TestOrchestrator, config: TestConfig):
     """Save all results to files"""
     output_path = Path(config.output_dir)
@@ -3948,6 +4124,12 @@ async def main():
             generate_graphs(orchestrator, config)
         except Exception as e:
             logger.warning(f"Failed to generate graphs: {e}")
+
+        if orchestrator.server_metric_snapshots:
+            try:
+                generate_server_metrics_graphs(orchestrator, config)
+            except Exception as e:
+                logger.warning(f"Failed to generate server-metrics graphs: {e}")
 
         try:
             import subprocess

@@ -131,6 +131,7 @@ def get_graph_files(output_path: Path) -> Dict[str, List[Path]]:
         'sustained': [],
         'heatmap': [],
         'single_prompt': [],
+        'server': [],
         'other': []
     }
 
@@ -139,7 +140,9 @@ def get_graph_files(output_path: Path) -> Dict[str, List[Path]]:
             continue
 
         name = html_file.name
-        if 'performance_vs_cache' in name or 'performance_vs_working_set' in name:
+        if name.startswith('server_'):
+            graphs['server'].append(html_file)
+        elif 'performance_vs_cache' in name or 'performance_vs_working_set' in name:
             graphs['performance'].append(html_file)
         elif 'comparison' in name or 'throughput_ctx' in name or 'ttft_comparison' in name:
             graphs['comparison'].append(html_file)
@@ -634,6 +637,29 @@ def generate_graphs_section(graphs: Dict[str, List[Path]], test_type: str) -> st
         <a href="{g.name}" class="graph-link">
             <h3>{g.stem}</h3>
             <p>Click to view</p>
+        </a>""")
+
+    # Server-side metrics graphs (vLLM + LMCache /metrics) — shown beneath the
+    # trace-replay graphs; the four existing graphs above are left unchanged.
+    if graphs['server']:
+        descriptions = {
+            'server_cache_hit_breakdown': (
+                'Cache Hit Breakdown (GPU vs CPU vs Compute)',
+                'Prompt-token sources and hit rates over time, incl. real per-request cached tokens'),
+            'server_lmcache_eviction': (
+                'LMCache Eviction & Memory',
+                'CPU-pool evictions, evicted keys, failures, forced unpins, pool usage and object counts'),
+            'server_lmcache_load_store': (
+                'LMCache Load / Store',
+                'Tokens stored vs served (re-store thrash signal), request volumes, and stage latencies'),
+        }
+        sections.append('<h3 style="margin-top: 20px;">Server-Side KV-Cache Metrics (vLLM + LMCache)</h3>')
+        for g in graphs['server']:
+            title, desc = descriptions.get(g.stem, (g.stem, 'Click to view'))
+            sections.append(f"""
+        <a href="{g.name}" class="graph-link tertiary">
+            <h3>{title}</h3>
+            <p>{desc}</p>
         </a>""")
 
     if not sections:
