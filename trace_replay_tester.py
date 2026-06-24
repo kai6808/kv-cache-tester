@@ -201,6 +201,12 @@ class TraceStats:
     total_input_tokens: int
     traces_with_tool_use: int
     max_shared_prefix_tokens: int = 0  # Max(tool_tokens + system_tokens) across traces
+    traces_with_subagents: int = 0
+    total_subagents: int = 0
+    subagent_total_requests: int = 0
+    subagent_total_input_tokens: int = 0
+    subagent_total_output_tokens: int = 0
+    subagent_max_turn_input_tokens: int = 0
 
 
 class TokenBucket:
@@ -620,6 +626,26 @@ class TraceManager:
             system_tokens = trace['metadata'].get('system_tokens', 0)
             max_shared_prefix = max(max_shared_prefix, tool_tokens + system_tokens)
 
+        # Sub-agent statistics (sub-agent entries keep compact 'in'/'out' field names)
+        traces_with_subagents = 0
+        total_subagents = 0
+        sa_total_requests = 0
+        sa_total_input = 0
+        sa_total_output = 0
+        sa_max_turn_input = 0
+        for trace in self.traces:
+            sas = [r for r in trace['requests'] if r.get('type') == 'subagent']
+            if sas:
+                traces_with_subagents += 1
+            total_subagents += len(sas)
+            for sa in sas:
+                inner = [x for x in sa.get('requests', []) if x.get('type') != 'subagent']
+                sa_total_requests += len(inner)
+                sa_total_input += sum(x.get('in', 0) for x in inner)
+                sa_total_output += sum(x.get('out', 0) for x in inner)
+                for x in inner:
+                    sa_max_turn_input = max(sa_max_turn_input, x.get('in', 0))
+
         self.stats = TraceStats(
             total_traces=total_before_filter,
             filtered_traces=len(self.traces),
@@ -630,7 +656,13 @@ class TraceManager:
             max_input_tokens=max(input_tokens) if input_tokens else 0,
             total_input_tokens=sum(input_tokens),
             traces_with_tool_use=tool_use_count,
-            max_shared_prefix_tokens=max_shared_prefix
+            max_shared_prefix_tokens=max_shared_prefix,
+            traces_with_subagents=traces_with_subagents,
+            total_subagents=total_subagents,
+            subagent_total_requests=sa_total_requests,
+            subagent_total_input_tokens=sa_total_input,
+            subagent_total_output_tokens=sa_total_output,
+            subagent_max_turn_input_tokens=sa_max_turn_input,
         )
 
     def get_random_trace(self) -> Optional[dict]:
@@ -3628,6 +3660,14 @@ async def main():
     logger.info(f"  Avg cache hit rate: {stats.avg_cache_hit_rate:.1%}")
     logger.info(f"  Traces with tool_use: {stats.traces_with_tool_use}")
     logger.info(f"  Max shared prefix (tool+system): {stats.max_shared_prefix_tokens:,} tokens")
+    logger.info(f"  Traces with sub-agents: {stats.traces_with_subagents}")
+    logger.info(f"  Total sub-agents: {stats.total_subagents}")
+    if stats.total_subagents:
+        n = stats.total_subagents
+        logger.info(f"    Inner requests: {stats.subagent_total_requests:,} (avg {stats.subagent_total_requests / n:.1f}/sub-agent)")
+        logger.info(f"    Input tokens (cumulative): {stats.subagent_total_input_tokens:,} (avg {stats.subagent_total_input_tokens / n:,.0f}/sub-agent)")
+        logger.info(f"    Output tokens: {stats.subagent_total_output_tokens:,} (avg {stats.subagent_total_output_tokens / n:,.0f}/sub-agent)")
+        logger.info(f"    Peak single-turn input: {stats.subagent_max_turn_input_tokens:,} tokens")
 
     logger.info(f"{'-' * 120}")
     logger.info(f"Configuration:")
