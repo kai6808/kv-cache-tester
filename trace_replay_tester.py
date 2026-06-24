@@ -310,6 +310,10 @@ class TestConfig:
     # Server-side metrics (vLLM + LMCache Prometheus /metrics). When False, behaviour is
     # identical to before: no scraping, no per-request cached_tokens, no extra HTML.
     server_metrics: bool = False
+    # Optional stop limits (None = unlimited). Combined with test_duration via OR:
+    # the run stops as soon as ANY set limit trips; only set limits are checked.
+    max_requests: Optional[int] = None  # stop after N completed requests (incl. sub-agent turns)
+    max_traces: Optional[int] = None    # run only the first N distinct trace files, to completion
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -2038,6 +2042,13 @@ class TestOrchestrator:
             enforce_budgets: If True, check per-period and working set budgets.
                             Set to False for initial users (warning only).
         """
+        # --max-traces gate: never admit a (N+1)th distinct trace file. This caps
+        # admission so the first N filtered traces run to completion, then the run
+        # ends naturally (works with or without --recycle).
+        if (self.config.max_traces is not None and
+                len(self.trace_manager.used_trace_ids) >= self.config.max_traces):
+            return None
+
         trace = self.trace_manager.get_random_trace()
         if trace is None:
             return None
@@ -2920,6 +2931,8 @@ class TestOrchestrator:
 
         try:
             while self.running:
+                # Stop conditions (OR semantics — only set limits are checked,
+                # whichever trips first wins; in-flight requests then drain below).
                 # Check test duration
                 if self.config.test_duration:
                     elapsed = time.time() - self.test_start_time
@@ -2927,10 +2940,27 @@ class TestOrchestrator:
                         logger.info(f"\n{Colors.HEADER}Test duration reached ({self.config.test_duration}s){Colors.ENDC}")
                         break
 
+                # Check max completed requests (includes sub-agent turns)
+                if self.config.max_requests and len(self.all_metrics) >= self.config.max_requests:
+                    logger.info(f"\n{Colors.HEADER}Max requests reached "
+                                f"({len(self.all_metrics)}/{self.config.max_requests}){Colors.ENDC}")
+                    break
+
+                # Has the --max-traces admission cap been hit? (first N distinct files used)
+                trace_cap_reached = (self.config.max_traces is not None and
+                                     len(self.trace_manager.used_trace_ids) >= self.config.max_traces)
+
                 # Check if we have any users or pending tasks
                 if not self.users and not pending_tasks:
-                    if not self.config.recycle:
-                        logger.info("All traces completed and recycling disabled")
+                    # End the run when there is no more work: either recycling is off
+                    # (traces play once), or the --max-traces cap is reached so no new
+                    # trace may be admitted even under --recycle.
+                    if not self.config.recycle or trace_cap_reached:
+                        if trace_cap_reached:
+                            logger.info(f"Max traces reached ({len(self.trace_manager.used_trace_ids)}"
+                                        f"/{self.config.max_traces}) — all admitted traces completed")
+                        else:
+                            logger.info("All traces completed and recycling disabled")
                         break
                     else:
                         self.create_user(advance=self.config.advance_all_users)
@@ -3838,6 +3868,13 @@ def parse_arguments():
                         help="Multiplier for API processing time with api-scaled strategy (default: 1.0)")
     parser.add_argument("--test-duration", type=int, default=None,
                         help="Maximum test duration in seconds (default: unlimited)")
+    parser.add_argument("--max-requests", type=int, default=None,
+                        help="Stop after this many completed requests, including sub-agent "
+                             "turns (default: unlimited). OR'd with --test-duration / --max-traces.")
+    parser.add_argument("--max-traces", type=int, default=None,
+                        help="Run only the first N distinct trace files (in selection order) "
+                             "to completion, then stop; forces termination even with --recycle "
+                             "(default: unlimited). OR'd with --test-duration / --max-requests.")
     parser.add_argument("--assessment-period", type=int, default=30,
                         help="Assessment period in seconds (default: 30)")
 
@@ -3971,6 +4008,8 @@ async def main():
         api_time_scale=args.api_time_scale,
         assessment_period=args.assessment_period,
         test_duration=args.test_duration,
+        max_requests=args.max_requests,
+        max_traces=args.max_traces,
         recycle=args.recycle,
         chunk_size=args.chunk_size,
         verbose=args.verbose,
@@ -4051,6 +4090,10 @@ async def main():
         logger.info(f"  Working Set Limit: unlimited")
     if config.test_duration:
         logger.info(f"  Test Duration: {config.test_duration}s")
+    if config.max_requests:
+        logger.info(f"  Max Requests: {config.max_requests}")
+    if config.max_traces:
+        logger.info(f"  Max Traces: {config.max_traces}")
     if config.max_concurrent_requests:
         logger.info(f"  Max Concurrent Requests: {config.max_concurrent_requests}")
     # Rate limiting summary
