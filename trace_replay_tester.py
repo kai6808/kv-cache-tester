@@ -1851,6 +1851,10 @@ class MetricsScraper:
         # vLLM external (LMCache-through-connector) conditional hit
         "vllm:external_prefix_cache_hits_total",
         "vllm:external_prefix_cache_queries_total",
+        # vLLM GPU-side eviction: num_preemptions is always on; the per-block
+        # eviction counter needs the server's --kv-cache-metrics flag (else 0).
+        "vllm:num_preemptions_total",
+        "vllm:kv_block_idle_before_evict_seconds_count",
         # vLLM latency histograms (sum + count → means)
         "vllm:time_to_first_token_seconds_sum", "vllm:time_to_first_token_seconds_count",
         "vllm:e2e_request_latency_seconds_sum", "vllm:e2e_request_latency_seconds_count",
@@ -1881,6 +1885,7 @@ class MetricsScraper:
 
     # Gauges (point-in-time): reported as-is, never delta'd.
     GAUGE_METRICS = [
+        "vllm:kv_cache_usage_perc",                   # GPU KV pool fullness (0-1)
         "lmcache:local_cache_usage",
         "lmcache:active_memory_objs_count",
         "lmcache:pinned_memory_objs_count",
@@ -3680,41 +3685,61 @@ def generate_server_metrics_graphs(orchestrator: TestOrchestrator, config: TestC
     logger.info("Generated: server_cache_hit_breakdown.html")
 
     # ------------------------------------------------------------------ #
-    # Page 2: LMCache eviction & memory
+    # Page 2: GPU + CPU eviction & memory
     # ------------------------------------------------------------------ #
     fige = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        subplot_titles=('CPU Eviction Activity (cumulative)', 'CPU Pool State (point-in-time)'),
-        vertical_spacing=0.12, specs=[[{"secondary_y": False}], [{"secondary_y": True}]]
+        rows=4, cols=1, shared_xaxes=True,
+        subplot_titles=('GPU Eviction Activity (cumulative)', 'GPU KV Pool Utilization (point-in-time)',
+                        'CPU Eviction Activity (cumulative)', 'CPU Pool State (point-in-time)'),
+        vertical_spacing=0.07,
+        specs=[[{"secondary_y": False}], [{"secondary_y": False}],
+               [{"secondary_y": False}], [{"secondary_y": True}]]
     )
-    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_count_total"),
-                              name='Evictions', mode='lines+markers', line=dict(color='#e74c3c')), row=1, col=1)
-    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_keys_count_total"),
-                              name='Evicted keys', mode='lines+markers', line=dict(color='#e67e22')), row=1, col=1)
-    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_failed_count_total"),
-                              name='Evict failures', mode='lines+markers', line=dict(color='#c0392b', dash='dash')), row=1, col=1)
-    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:forced_unpin_count_total"),
-                              name='Forced unpins', mode='lines+markers', line=dict(color='#8e44ad', dash='dash')), row=1, col=1)
+    # Row 1: GPU prefix-cache / running-batch eviction. num_preemptions is
+    # always on; kv_block_idle_before_evict_seconds_count is 0 unless the server
+    # was started with --kv-cache-metrics (+ --kv-cache-metrics-sample 1.0).
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("vllm:kv_block_idle_before_evict_seconds_count"),
+                              name='GPU blocks evicted', mode='lines+markers', line=dict(color='#e74c3c')), row=1, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("vllm:num_preemptions_total"),
+                              name='Preemptions', mode='lines+markers', line=dict(color='#e67e22', dash='dash')), row=1, col=1)
 
+    # Row 2: GPU KV pool fullness (perc gauge is 0-1 → %).
+    fige.add_trace(go.Scatter(x=xs, y=[v * 100.0 for v in gval("vllm:kv_cache_usage_perc")],
+                              name='GPU KV usage (%)', mode='lines+markers',
+                              fill='tozeroy', line=dict(color='#27ae60')), row=2, col=1)
+
+    # Row 3: CPU (LMCache) eviction.
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_count_total"),
+                              name='Evictions', mode='lines+markers', line=dict(color='#e74c3c')), row=3, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_keys_count_total"),
+                              name='Evicted keys', mode='lines+markers', line=dict(color='#e67e22')), row=3, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:local_cpu_evict_failed_count_total"),
+                              name='Evict failures', mode='lines+markers', line=dict(color='#c0392b', dash='dash')), row=3, col=1)
+    fige.add_trace(go.Scatter(x=xs, y=cdelta("lmcache:forced_unpin_count_total"),
+                              name='Forced unpins', mode='lines+markers', line=dict(color='#8e44ad', dash='dash')), row=3, col=1)
+
+    # Row 4: CPU pool state.
     fige.add_trace(go.Scatter(x=xs, y=[v / 1e9 for v in gval("lmcache:local_cache_usage")],
                               name='CPU pool usage (GB)', mode='lines+markers',
-                              fill='tozeroy', line=dict(color='#3498db')), row=2, col=1)
+                              fill='tozeroy', line=dict(color='#3498db')), row=4, col=1)
     fige.add_trace(go.Scatter(x=xs, y=gval("lmcache:active_memory_objs_count"),
                               name='Active objs', mode='lines+markers', line=dict(color='#16a085')),
-                   row=2, col=1, secondary_y=True)
+                   row=4, col=1, secondary_y=True)
     fige.add_trace(go.Scatter(x=xs, y=gval("lmcache:pinned_memory_objs_count"),
                               name='Pinned objs', mode='lines+markers', line=dict(color='#95a5a6', dash='dot')),
-                   row=2, col=1, secondary_y=True)
+                   row=4, col=1, secondary_y=True)
 
     fige.update_layout(
-        title=f'LMCache Eviction & Memory<br><sub>Model: {model} | policy: {os.environ.get("LMCACHE_CACHE_POLICY", "?")}</sub>',
-        height=700, showlegend=True,
+        title=f'GPU + CPU Eviction & Memory<br><sub>Model: {model} | CPU policy: {os.environ.get("LMCACHE_CACHE_POLICY", "?")}</sub>',
+        height=1200, showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis2=dict(title='Elapsed (s)')
+        xaxis4=dict(title='Elapsed (s)')
     )
     fige.update_yaxes(title_text='Count', row=1, col=1)
-    fige.update_yaxes(title_text='Usage (GB)', row=2, col=1, secondary_y=False)
-    fige.update_yaxes(title_text='Objects', row=2, col=1, secondary_y=True)
+    fige.update_yaxes(title_text='Usage (%)', range=[0, 100], row=2, col=1)
+    fige.update_yaxes(title_text='Count', row=3, col=1)
+    fige.update_yaxes(title_text='Usage (GB)', row=4, col=1, secondary_y=False)
+    fige.update_yaxes(title_text='Objects', row=4, col=1, secondary_y=True)
     fige.write_html(output_path / "server_lmcache_eviction.html")
     logger.info("Generated: server_lmcache_eviction.html")
 
