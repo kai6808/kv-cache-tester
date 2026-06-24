@@ -307,6 +307,9 @@ class TestConfig:
     advance_min: float = 0.0  # Minimum start position as fraction (0.0-1.0)
     advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
     advance_all_users: bool = False  # If True, advance all users; if False, only initial users
+    # Server-side metrics (vLLM + LMCache Prometheus /metrics). When False, behaviour is
+    # identical to before: no scraping, no per-request cached_tokens, no extra HTML.
+    server_metrics: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -342,9 +345,19 @@ class RequestMetrics:
     # Token chunk timing for proportional output attribution
     token_timestamps: List[float] = field(default_factory=list)
     tokens_per_chunk: List[int] = field(default_factory=list)
+    # Server-reported (vLLM usage) cache signal — populated only with --server-metrics.
+    # cached_tokens / server_prompt_tokens = real per-request prefix-cache hit fraction.
+    cached_tokens: Optional[int] = None
+    server_prompt_tokens: Optional[int] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Keep output identical to legacy runs: only surface the server-metrics columns
+        # when they were actually collected.
+        if self.cached_tokens is None and self.server_prompt_tokens is None:
+            d.pop('cached_tokens', None)
+            d.pop('server_prompt_tokens', None)
+        return d
 
 
 @dataclass
@@ -1704,6 +1717,7 @@ class APIClient:
         token_count = 0
         token_timestamps: List[float] = []
         tokens_per_chunk: List[int] = []
+        usage = None  # last seen usage object (carries prompt_tokens_details.cached_tokens)
 
         try:
             params = self._build_request_params(messages, max_tokens, stream)
@@ -1712,6 +1726,9 @@ class APIClient:
                 response = await self.client.chat.completions.create(**params)
 
                 async for chunk in response:
+                    # Final usage chunk (stream_options.include_usage) has empty choices
+                    if getattr(chunk, 'usage', None):
+                        usage = chunk.usage
                     if chunk.choices:
                         delta = chunk.choices[0].delta
                         content_text = delta.content or ""
@@ -1746,6 +1763,7 @@ class APIClient:
                 first_token_time = time.time()
                 complete_time = first_token_time
 
+                usage = response.usage
                 if response.choices:
                     response_text = response.choices[0].message.content or ""
                     token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
@@ -1755,6 +1773,15 @@ class APIClient:
 
             ttft = (first_token_time - start_time) if first_token_time else 0
             ttlt = complete_time - start_time
+
+            # Real per-request prefix-cache hit signal from vLLM usage (if present)
+            cached_tokens = None
+            server_prompt_tokens = None
+            if usage is not None:
+                server_prompt_tokens = getattr(usage, 'prompt_tokens', None)
+                details = getattr(usage, 'prompt_tokens_details', None)
+                if details is not None:
+                    cached_tokens = getattr(details, 'cached_tokens', None)
 
             return {
                 'response_text': response_text,
@@ -1766,7 +1793,9 @@ class APIClient:
                 'first_token_time': first_token_time or start_time,
                 'complete_time': complete_time,
                 'token_timestamps': token_timestamps,
-                'tokens_per_chunk': tokens_per_chunk
+                'tokens_per_chunk': tokens_per_chunk,
+                'cached_tokens': cached_tokens,
+                'server_prompt_tokens': server_prompt_tokens,
             }
 
         except Exception as e:
@@ -1792,6 +1821,126 @@ class APIClient:
 
 
 # =============================================================================
+# Server-side metrics scraper (vLLM + LMCache Prometheus /metrics)
+# =============================================================================
+
+class MetricsScraper:
+    """Scrapes a curated subset of the server's Prometheus /metrics for KV-cache
+    eviction research.
+
+    Only metrics that are meaningful for GPU/CPU eviction analysis are kept. We
+    deliberately exclude, per logs/analysis/METRICS.md:
+      - broken gauges stuck at 0/1: lmcache:lookup_hit_rate, lmcache:retrieve_hit_rate
+      - the misleading per-request gauge: lmcache:request_cache_hit_rate
+      - the duplicate vllm:prefix_cache_hits/queries (== family-A GPU share)
+      - lmcache:num_requested_tokens_total (== num_hit_tokens_total here)
+      - remote-backend counters (unused on a local CPU pool)
+    For each metric we keep only the single authoritative series, summed across
+    worker/engine labels.
+    """
+
+    # Counters (monotonic): downstream derives deltas as value - baseline.
+    COUNTER_METRICS = [
+        # vLLM token accounting (family A — partitions all prompt tokens)
+        "vllm:prompt_tokens_total",
+        "vllm:prompt_tokens_cached_total",            # authoritative overall hit (GPU+CPU)
+        # vLLM external (LMCache-through-connector) conditional hit
+        "vllm:external_prefix_cache_hits_total",
+        "vllm:external_prefix_cache_queries_total",
+        # vLLM latency histograms (sum + count → means)
+        "vllm:time_to_first_token_seconds_sum", "vllm:time_to_first_token_seconds_count",
+        "vllm:e2e_request_latency_seconds_sum", "vllm:e2e_request_latency_seconds_count",
+        "vllm:inter_token_latency_seconds_sum", "vllm:inter_token_latency_seconds_count",
+        "vllm:request_queue_time_seconds_sum", "vllm:request_queue_time_seconds_count",
+        "vllm:request_prefill_time_seconds_sum", "vllm:request_prefill_time_seconds_count",
+        # LMCache hit rate (authoritative lmcache-side)
+        "lmcache:num_lookup_hits_total", "lmcache:num_lookup_tokens_total",
+        # LMCache load/store volumes (num_stored_tokens includes re-stores → thrash signal)
+        "lmcache:num_store_requests_total", "lmcache:num_stored_tokens_total",
+        "lmcache:num_retrieve_requests_total", "lmcache:num_hit_tokens_total",
+        # LMCache eviction
+        "lmcache:local_cpu_evict_count_total", "lmcache:local_cpu_evict_keys_count_total",
+        "lmcache:local_cpu_evict_failed_count_total", "lmcache:forced_unpin_count_total",
+        # LMCache stage timings (sum + count → means)
+        "lmcache:time_to_store_sum", "lmcache:time_to_store_count",
+        "lmcache:store_from_gpu_time_sum", "lmcache:store_from_gpu_time_count",
+        "lmcache:time_to_retrieve_sum", "lmcache:time_to_retrieve_count",
+        "lmcache:retrieve_to_gpu_time_sum", "lmcache:retrieve_to_gpu_time_count",
+        "lmcache:time_to_lookup_sum", "lmcache:time_to_lookup_count",
+        "lmcache:store_speed_sum", "lmcache:store_speed_count",
+        "lmcache:retrieve_speed_sum", "lmcache:retrieve_speed_count",
+    ]
+
+    # family-A token-source breakdown: one metric, split by the `source` label.
+    SOURCE_METRIC = "vllm:prompt_tokens_by_source_total"
+    SOURCE_LABELS = ("local_compute", "local_cache_hit", "external_kv_transfer")
+
+    # Gauges (point-in-time): reported as-is, never delta'd.
+    GAUGE_METRICS = [
+        "lmcache:local_cache_usage",
+        "lmcache:active_memory_objs_count",
+        "lmcache:pinned_memory_objs_count",
+    ]
+
+    def __init__(self, api_endpoint: str):
+        self.metrics_url = api_endpoint.rstrip('/') + '/metrics'
+        self.failed = False  # set True after first failure → caller stops scraping
+
+    @classmethod
+    def _parse(cls, text: str) -> dict:
+        counters = {k: 0.0 for k in cls.COUNTER_METRICS}
+        gauges = {k: 0.0 for k in cls.GAUGE_METRICS}
+        sources = {s: 0.0 for s in cls.SOURCE_LABELS}
+        wanted_counters = set(cls.COUNTER_METRICS)
+        wanted_gauges = set(cls.GAUGE_METRICS)
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line[0] == '#':
+                continue
+            sp = line.rfind(' ')
+            if sp == -1:
+                continue
+            metric, val = line[:sp], line[sp + 1:]
+            try:
+                v = float(val)
+            except ValueError:
+                continue
+            brace = metric.find('{')
+            name = metric[:brace] if brace != -1 else metric
+            if name in wanted_counters:
+                counters[name] += v
+            elif name in wanted_gauges:
+                gauges[name] += v
+            elif name == cls.SOURCE_METRIC and brace != -1:
+                labels = metric[brace:]
+                for s in cls.SOURCE_LABELS:
+                    if f'source="{s}"' in labels:
+                        sources[s] += v
+                        break
+        return {"counters": counters, "gauges": gauges, "sources": sources}
+
+    async def snapshot(self, elapsed: float, label: str) -> Optional[dict]:
+        """Fetch /metrics once and return a parsed snapshot, or None on failure."""
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.metrics_url, timeout=10) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    text = await resp.text()
+        except Exception as e:
+            self.failed = True
+            logger.warning(f"{Colors.WARNING}Server metrics scrape failed "
+                           f"({self.metrics_url}): {e}. Disabling further scrapes.{Colors.ENDC}")
+            return None
+        snap = self._parse(text)
+        snap["label"] = label
+        snap["elapsed"] = elapsed
+        snap["wall_time"] = time.time()
+        return snap
+
+
+# =============================================================================
 # Test Orchestrator
 # =============================================================================
 
@@ -1810,6 +1959,12 @@ class TestOrchestrator:
         self.lifecycle_events: List[UserLifecycleEvent] = []
         self.all_metrics: List[RequestMetrics] = []
         self.assessment_periods: List[AssessmentPeriodMetrics] = []
+
+        # Server-side metrics (vLLM + LMCache /metrics). Only active with --server-metrics.
+        self.metrics_scraper: Optional[MetricsScraper] = (
+            MetricsScraper(config.api_endpoint) if config.server_metrics else None
+        )
+        self.server_metric_snapshots: List[dict] = []
 
         # Live output token stream — captures chunks as they arrive from streaming API,
         # before request completion. Used for accurate per-period output tok/s.
@@ -2679,7 +2834,9 @@ class TestOrchestrator:
             prefill_complete_time=prefill_complete_time,
             request_complete_time=request_complete_time,
             token_timestamps=token_timestamps,
-            tokens_per_chunk=tokens_per_chunk
+            tokens_per_chunk=tokens_per_chunk,
+            cached_tokens=result.get('cached_tokens') if self.config.server_metrics else None,
+            server_prompt_tokens=result.get('server_prompt_tokens') if self.config.server_metrics else None,
         )
 
         user.metrics.append(metrics)
@@ -2711,11 +2868,24 @@ class TestOrchestrator:
 
         return metrics
 
+    async def _scrape_server_metrics(self, label: str):
+        """Take one server /metrics snapshot (no-op unless --server-metrics)."""
+        if not self.metrics_scraper or self.metrics_scraper.failed:
+            return
+        elapsed = (time.time() - self.test_start_time) if self.test_start_time else 0.0
+        snap = await self.metrics_scraper.snapshot(elapsed, label)
+        if snap is not None:
+            self.server_metric_snapshots.append(snap)
+
     async def run(self):
         """Main test loop"""
         self.test_start_time = time.time()
         self.current_period_start = time.time()
         period_number = 0
+
+        # Baseline server-side metrics snapshot (counters are cumulative; later
+        # snapshots are reported as deltas against this).
+        await self._scrape_server_metrics("baseline")
 
         logger.info(f"\n{Colors.HEADER}Starting test with {self.config.start_users} user(s)...{Colors.ENDC}\n")
 
@@ -2958,6 +3128,9 @@ class TestOrchestrator:
                     self.assessment_periods.append(assessment)
                     self.print_assessment(assessment)
 
+                    # Per-period server-side metrics snapshot (→ time series)
+                    await self._scrape_server_metrics(f"period_{period_number}")
+
                     # Update rolling TTFT history
                     ttft_val = self.get_ttft_value()
                     self.ttft_history.append(ttft_val)  # None if no data this period
@@ -3017,6 +3190,9 @@ class TestOrchestrator:
                 logger.warning(f"{len(pending)} requests still outstanding after 60s timeout — cancelling")
                 for task in pending:
                     task.cancel()
+
+        # Final server-side metrics snapshot
+        await self._scrape_server_metrics("final")
 
         self.running = False
         self.print_summary()
@@ -3401,6 +3577,12 @@ def save_results(orchestrator: TestOrchestrator, config: TestConfig):
         df.to_csv(output_path / "user_lifecycle.csv", index=False)
         logger.info(f"Saved user lifecycle: {len(df)} events")
 
+    # Save raw server-side metric snapshots (only when --server-metrics collected any)
+    if orchestrator.server_metric_snapshots:
+        with open(output_path / "server_metrics.json", 'w') as f:
+            json.dump(orchestrator.server_metric_snapshots, f, indent=2)
+        logger.info(f"Saved server metrics: {len(orchestrator.server_metric_snapshots)} snapshots")
+
     # Save test metadata
     metadata = {
         "model": orchestrator.api_client.model,
@@ -3498,6 +3680,11 @@ def parse_arguments():
                         help="Enable verbose logging")
     parser.add_argument("--skip-graphs", action="store_true",
                         help="Skip graph generation")
+    parser.add_argument("--server-metrics", action="store_true",
+                        help="Scrape the server's Prometheus /metrics (vLLM + LMCache) for "
+                             "GPU/CPU eviction, hit-rate, and load/store data, capture real "
+                             "per-request cached_tokens, and emit the extra eviction HTML. "
+                             "Off by default — behaviour is then identical to before.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for both trace selection and prompt generation (convenience; overridden by --trace-seed / --prompt-seed)")
     parser.add_argument("--trace-seed", type=int, default=None,
@@ -3628,6 +3815,7 @@ async def main():
         advance_min=args.advance_min,
         advance_max=args.advance_max,
         advance_all_users=args.advance_all_users,
+        server_metrics=args.server_metrics,
         max_prefill_concurrent=args.max_prefill_concurrent,
         max_decode_concurrent=args.max_decode_concurrent,
         otpm_budget=args.otpm_budget,
