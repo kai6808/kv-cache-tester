@@ -3674,9 +3674,11 @@ def generate_server_metrics_graphs(orchestrator: TestOrchestrator, config: TestC
                        annotation_text=f"Per-request usage cached: {ct/pt:.1%}", row=2, col=1)
 
     figh.update_layout(
-        title=f'Cache Hit Breakdown (GPU vs CPU vs Compute)<br><sub>Model: {model}</sub>',
+        title=dict(text=f'Cache Hit Breakdown (GPU vs CPU vs Compute)<br><sub>Model: {model}</sub>',
+                   x=0.5, xanchor='center', y=0.98, yanchor='top'),
         height=700, showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=110, r=260),
+        legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.01),
         xaxis2=dict(title='Elapsed (s)')
     )
     figh.update_yaxes(title_text='Tokens', row=1, col=1)
@@ -3730,9 +3732,12 @@ def generate_server_metrics_graphs(orchestrator: TestOrchestrator, config: TestC
                    row=4, col=1, secondary_y=True)
 
     fige.update_layout(
-        title=f'GPU + CPU Eviction & Memory<br><sub>Model: {model} | CPU policy: {os.environ.get("LMCACHE_CACHE_POLICY", "?")}</sub>',
+        title=dict(text=f'GPU + CPU Eviction & Memory<br><sub>Model: {model} | CPU policy: '
+                        f'{os.environ.get("LMCACHE_CACHE_POLICY", "?")}</sub>',
+                   x=0.5, xanchor='center', y=0.98, yanchor='top'),
         height=1200, showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=120, r=230),
+        legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.01),
         xaxis4=dict(title='Elapsed (s)')
     )
     fige.update_yaxes(title_text='Count', row=1, col=1)
@@ -3773,9 +3778,11 @@ def generate_server_metrics_graphs(orchestrator: TestOrchestrator, config: TestC
                               name='time_to_lookup', mode='lines+markers', line=dict(color='#9b59b6')), row=3, col=1)
 
     figl.update_layout(
-        title=f'LMCache Load / Store<br><sub>Model: {model}</sub>',
+        title=dict(text=f'LMCache Load / Store<br><sub>Model: {model}</sub>',
+                   x=0.5, xanchor='center', y=0.98, yanchor='top'),
         height=900, showlegend=True, template='plotly_white',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        margin=dict(t=110, r=240),
+        legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.01)
     )
     figl.update_yaxes(title_text='Tokens', row=1, col=1)
     figl.update_yaxes(title_text='Requests', row=2, col=1)
