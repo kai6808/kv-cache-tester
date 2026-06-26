@@ -183,7 +183,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Offline Belady/OPT simulator for LMCache CPU access logs"
     )
-    parser.add_argument("log", type=Path, help="Path to cpu_access.jsonl")
+    parser.add_argument(
+        "log", type=Path,
+        help="Path to cpu_access.<ts>.<pid>.jsonl, or its parent directory "
+             "(auto-selects the most recent cpu_access.*.jsonl in that dir)"
+    )
     parser.add_argument(
         "--budget-gb", type=float, required=True,
         help="CPU pool size in GB (LMCACHE_MAX_LOCAL_CPU_SIZE from the run)"
@@ -196,8 +200,17 @@ def main() -> None:
 
     budget_bytes = int(args.budget_gb * 1024 ** 3)
 
-    print(f"Loading {args.log} ...")
-    events = load_events(args.log)
+    log_path = args.log
+    if log_path.is_dir():
+        candidates = sorted(log_path.glob("cpu_access.*.jsonl"), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            print(f"ERROR: no cpu_access.*.jsonl found in {log_path}", file=sys.stderr)
+            sys.exit(1)
+        log_path = candidates[-1]
+        print(f"Auto-selected: {log_path}")
+
+    print(f"Loading {log_path} ...")
+    events = load_events(log_path)
 
     log_stores = sum(1 for e in events if e["op"] == "store")
     log_hits   = sum(1 for e in events if e["op"] == "hit")
@@ -284,7 +297,7 @@ def main() -> None:
     # Write JSON report
     # ------------------------------------------------------------------
     report = {
-        "log": str(args.log),
+        "log": str(log_path),
         "budget_gb": args.budget_gb,
         "budget_bytes": budget_bytes,
         "log_stats": {
@@ -303,7 +316,7 @@ def main() -> None:
         "policies": {name: r for name, r in policies},
         "gap_opt_minus_lru_pp": gap_pp,
     }
-    report_path = args.log.parent / "belady_report.json"
+    report_path = log_path.parent / "belady_report.json"
     report_path.write_text(json.dumps(report, indent=2))
     print(f"Report written to {report_path}")
 

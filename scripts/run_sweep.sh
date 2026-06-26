@@ -79,8 +79,10 @@ launch_server() {
     local policy="$1" cpu="$2" logf="$3"
     rm -rf "$PROM_DIR" && mkdir -p "$PROM_DIR"
     local _access_log_env=()
-    [[ "${ENABLE_ACCESS_LOG:-0}" == "1" ]] && \
+    if [[ "${ENABLE_ACCESS_LOG:-0}" == "1" ]]; then
+        mkdir -p "$outdir"
         _access_log_env=("LMCACHE_ACCESS_LOG=$outdir/cpu_access.jsonl")
+    fi
     # setsid => new process group we can kill wholesale (vllm spawns workers).
     setsid env \
         PYTHONHASHSEED=0 \
