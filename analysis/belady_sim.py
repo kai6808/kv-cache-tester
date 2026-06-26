@@ -64,6 +64,58 @@ def build_next_use_map(demand: list[dict]) -> dict[int, deque]:
     return {h: deque(ps) for h, ps in pos.items()}
 
 
+def compute_opt_capacity(demand: list[dict]) -> dict[str, Any]:
+    """Minimum CPU capacity for OPT to need zero evictions.
+
+    Uses a sweep-line over chunk lifetimes: a chunk is "live" from its first
+    access to its last access in the demand sequence (OPT can evict it the
+    instant its last use is served).  The peak concurrent live bytes is the
+    minimum budget at which OPT never needs to evict anything.
+
+    Also computes the theoretical maximum hit rate at that capacity: every
+    unique chunk incurs exactly one first-access miss; all subsequent accesses
+    are hits.
+    """
+    first: dict[int, int] = {}
+    last:  dict[int, int] = {}
+    sizes: dict[int, int] = {}
+    for i, ev in enumerate(demand):
+        h = ev["chunk_hash"]
+        if h not in first:
+            first[h] = i
+        last[h] = i
+        sizes[h] = ev["size_bytes"]
+
+    # Sweep line: +size at first[h], -size at last[h]+1
+    delta: dict[int, int] = defaultdict(int)
+    for h in first:
+        delta[first[h]] += sizes[h]
+        delta[last[h] + 1] -= sizes[h]
+
+    peak_bytes = 0
+    peak_pos   = 0
+    cur        = 0
+    for pos in range(len(demand) + 1):
+        cur += delta[pos]
+        if cur > peak_bytes:
+            peak_bytes = cur
+            peak_pos   = pos
+
+    unique_chunks  = len(first)
+    total_accesses = len(demand)
+    max_hits       = total_accesses - unique_chunks  # one miss per unique chunk
+    max_hit_rate   = max_hits / total_accesses if total_accesses else 0.0
+
+    return {
+        "min_capacity_bytes": peak_bytes,
+        "min_capacity_gb":    peak_bytes / 1024 ** 3,
+        "peak_demand_pos":    peak_pos,
+        "max_hit_rate":       max_hit_rate,
+        "max_hits":           max_hits,
+        "max_misses":         unique_chunks,
+    }
+
+
 def _advance_next_use(nxt_map: dict[int, deque], h: int, current: int) -> int:
     """Return the next demand position for h after `current`, or INF."""
     q = nxt_map.get(h)
@@ -260,6 +312,13 @@ def main() -> None:
     print()
 
     # ------------------------------------------------------------------
+    # Optimal capacity analysis
+    # ------------------------------------------------------------------
+    print("Computing optimal capacity ...")
+    opt_cap = compute_opt_capacity(demand)
+    print()
+
+    # ------------------------------------------------------------------
     # Results table
     # ------------------------------------------------------------------
     policies = [("LRU", lru), ("OPT", opt)]
@@ -292,6 +351,16 @@ def main() -> None:
         f"at {args.budget_gb} GB)"
     )
     print()
+    print(
+        f"Optimal capacity  : {opt_cap['min_capacity_gb']:.3f} GB  "
+        f"({opt_cap['min_capacity_bytes']:,} bytes)  — "
+        f"zero evictions at or above this budget"
+    )
+    print(
+        f"Max hit rate (OPT): {opt_cap['max_hit_rate']*100:.2f}%  "
+        f"(limited only by {opt_cap['max_misses']:,} first-access misses)"
+    )
+    print()
 
     # ------------------------------------------------------------------
     # Write JSON report
@@ -315,8 +384,10 @@ def main() -> None:
         },
         "policies": {name: r for name, r in policies},
         "gap_opt_minus_lru_pp": gap_pp,
+        "opt_capacity": opt_cap,
     }
-    report_path = log_path.parent / "belady_report.json"
+    gb_tag = f"{args.budget_gb:g}"
+    report_path = log_path.parent / f"belady_report_cpu{gb_tag}.json"
     report_path.write_text(json.dumps(report, indent=2))
     print(f"Report written to {report_path}")
 
