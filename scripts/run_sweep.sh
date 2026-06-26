@@ -78,6 +78,9 @@ build_run_name() {
 launch_server() {
     local policy="$1" cpu="$2" logf="$3"
     rm -rf "$PROM_DIR" && mkdir -p "$PROM_DIR"
+    local _access_log_env=()
+    [[ "${ENABLE_ACCESS_LOG:-0}" == "1" ]] && \
+        _access_log_env=("LMCACHE_ACCESS_LOG=$outdir/cpu_access.jsonl")
     # setsid => new process group we can kill wholesale (vllm spawns workers).
     setsid env \
         PYTHONHASHSEED=0 \
@@ -86,6 +89,7 @@ launch_server() {
         LMCACHE_MAX_LOCAL_CPU_SIZE="$cpu" \
         LMCACHE_CHUNK_SIZE="$LMCACHE_CHUNK_SIZE" \
         LMCACHE_CACHE_POLICY="$policy" \
+        "${_access_log_env[@]}" \
         HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
         vllm serve "$MODEL" \
             --port "$PORT" \
