@@ -2,14 +2,20 @@
 """Offline Belady/OPT simulator for LMCache CPU access logs.
 
 Reads the cpu_access.jsonl produced by Phase 1 (LMCACHE_ACCESS_LOG) and
-replays the demand sequence under OPT and LRU, then compares results.
+replays the demand sequence under OPT (and LRU), then compares against the
+measured (logged) policy.
 
 Usage:
-    python analysis/belady_sim.py <run_dir>/cpu_access.jsonl --budget-gb 40
+    # trace from an LRU run (default): OPT vs LRU, with an LRU faithfulness check
+    python3 analysis/belady_sim.py <run_dir>/cpu_access.jsonl --budget-gb 40
+
+    # trace from a non-LRU run (e.g. QSLRU): OPT vs measured, LRU shown as a
+    # reference on the same demand sequence (no spurious faithfulness failure)
+    python3 analysis/belady_sim.py <run_dir>/cpu_access.jsonl --budget-gb 40 --trace-policy QSLRU
 
 Outputs:
-    <run_dir>/belady_report.json   machine-readable results
-    stdout                          human-readable table + faithfulness check
+    <run_dir>/belady_report_cpu<N>.json   machine-readable results
+    stdout                                 human-readable table + (LRU) faithfulness
 
 Notes:
     - can_evict pinning is ignored (treated as always evictable).  Impact is
@@ -17,8 +23,13 @@ Notes:
       and LRU already deprioritises them (they were just accessed = MRU).
     - The demand sequence (store + hit events) is approximately
       policy-independent: GPU-prefix-cache misses determine which chunks
-      reach the CPU tier, which is unaffected by the CPU eviction policy.
-      The LRU faithfulness check validates this assumption.
+      reach the CPU tier, which is unaffected by the CPU eviction policy. So
+      OPT and the LRU reference are comparable across CPU policies, and the
+      LRU faithfulness check (for --trace-policy LRU) validates this assumption.
+    - A non-LRU CPU policy (e.g. QSLRU) cannot be replayed offline: its
+      queue-demand signal is not in the CPU access log. For --trace-policy != LRU
+      the measured row is taken directly from the logged events (ground truth),
+      and OPT/LRU are simulated on the (policy-independent) demand sequence.
 """
 import argparse
 import heapq
@@ -192,7 +203,8 @@ def simulate_opt(demand: list[dict], budget_bytes: int) -> dict[str, Any]:
 
 
 def simulate_lru(demand: list[dict], budget_bytes: int) -> dict[str, Any]:
-    """LRU simulation for faithfulness check against the measured log."""
+    """LRU simulation: faithfulness check vs the log for an LRU trace, and a
+    reference baseline on the same demand sequence for a non-LRU trace."""
     # OrderedDict: LRU at front (last=False on popitem), MRU at back.
     cache: OrderedDict[int, int] = OrderedDict()
     used = 0
@@ -227,6 +239,38 @@ def simulate_lru(demand: list[dict], budget_bytes: int) -> dict[str, Any]:
     }
 
 
+def measured_from_log(events: list[dict]) -> dict[str, Any]:
+    """Ground-truth CPU-tier stats taken directly from the logged events.
+
+    Unlike the simulators, this reflects whatever eviction policy actually ran:
+    hits/misses/evictions are counted from the log rather than recomputed. Used
+    as the measured baseline for a trace whose policy cannot be replayed offline
+    (e.g. QSLRU, whose queue-demand signal is not in the CPU access log). A
+    "store" is a CPU-tier miss (the chunk had to be (re)written); a "hit" is a
+    CPU-tier hit; an "evict" is one removed chunk.
+    """
+    hits = misses = evictions = 0
+    hit_bytes = stored_bytes = 0
+    for e in events:
+        op = e["op"]
+        if op == "hit":
+            hits += 1
+            hit_bytes += e["size_bytes"]
+        elif op == "store":
+            misses += 1
+            stored_bytes += e["size_bytes"]
+        elif op == "evict":
+            evictions += 1
+    total = hits + misses
+    return {
+        "hits": hits,
+        "misses": misses,
+        "evictions": evictions,
+        "hit_rate": hits / total if total else 0.0,
+        "write_amp": stored_bytes / hit_bytes if hit_bytes else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -247,6 +291,13 @@ def main() -> None:
     parser.add_argument(
         "--faithfulness-tol", type=float, default=5.0,
         help="Max allowed pp deviation for LRU faithfulness check (default: 5.0)"
+    )
+    parser.add_argument(
+        "--trace-policy", type=str, default="LRU",
+        help="CPU eviction policy that produced the log (default: LRU). For LRU, "
+             "an LRU faithfulness check runs. For any other value (e.g. QSLRU), the "
+             "measured row is taken from the log and LRU is shown as a reference; "
+             "OPT is policy-independent and computed either way."
     )
     args = parser.parse_args()
 
@@ -283,24 +334,40 @@ def main() -> None:
     print()
 
     # ------------------------------------------------------------------
-    # LRU simulation + faithfulness check
+    # Measured ground truth + LRU simulation / faithfulness
     # ------------------------------------------------------------------
+    trace_policy = args.trace_policy.strip()
+    is_lru_trace = trace_policy.upper() == "LRU"
+
+    # Ground truth from the log (reflects whatever policy actually ran).
+    measured = measured_from_log(events)
+    log_hr = measured["hit_rate"]
+
     print("Simulating LRU ...")
     lru = simulate_lru(demand, budget_bytes)
 
-    log_hr = log_hits / (log_hits + log_stores) if (log_hits + log_stores) else 0.0
     delta_pp = abs(lru["hit_rate"] - log_hr) * 100
-    faithful = delta_pp <= args.faithfulness_tol
-    faith_label = (
-        f"PASS  (|sim {lru['hit_rate']*100:.2f}% - log {log_hr*100:.2f}%| = {delta_pp:.2f} pp)"
-        if faithful else
-        f"FAIL  (|sim {lru['hit_rate']*100:.2f}% - log {log_hr*100:.2f}%| = {delta_pp:.2f} pp > {args.faithfulness_tol} pp)"
-    )
-    print(f"LRU faithfulness: {faith_label}")
-    if not faithful:
+    faithful = None
+    if is_lru_trace:
+        faithful = delta_pp <= args.faithfulness_tol
+        faith_label = (
+            f"PASS  (|sim {lru['hit_rate']*100:.2f}% - log {log_hr*100:.2f}%| = {delta_pp:.2f} pp)"
+            if faithful else
+            f"FAIL  (|sim {lru['hit_rate']*100:.2f}% - log {log_hr*100:.2f}%| = {delta_pp:.2f} pp > {args.faithfulness_tol} pp)"
+        )
+        print(f"LRU faithfulness: {faith_label}")
+        if not faithful:
+            print(
+                "  WARNING: divergence exceeds tolerance. Possible causes: "
+                "can_evict pinning, concurrent access reordering in the log."
+            )
+    else:
         print(
-            "  WARNING: divergence exceeds tolerance. Possible causes: "
-            "can_evict pinning, concurrent access reordering in the log."
+            f"Trace policy: {trace_policy} (not LRU) — the {trace_policy} row is taken "
+            f"directly from the log; LRU is a reference on the same (GPU-miss-gated, "
+            f"policy-independent) demand sequence. {trace_policy} cannot be replayed "
+            f"offline (its queue-demand signal is not in the CPU access log), so no "
+            f"faithfulness check is run."
         )
     print()
 
@@ -321,7 +388,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Results table
     # ------------------------------------------------------------------
-    policies = [("LRU", lru), ("OPT", opt)]
+    if is_lru_trace:
+        policies = [("LRU", lru), ("OPT", opt)]
+    else:
+        policies = [(trace_policy, measured), ("LRU(ref)", lru), ("OPT", opt)]
     opt_hr = opt["hit_rate"]
 
     col = "{:<8}  {:>10}  {:>10}  {:>9}  {:>9}  {:>11}  {:>10}"
@@ -344,12 +414,17 @@ def main() -> None:
         ))
 
     print()
-    gap_pp = (opt_hr - lru["hit_rate"]) * 100
+    baseline_name = "LRU" if is_lru_trace else trace_policy
+    baseline_hr = lru["hit_rate"] if is_lru_trace else measured["hit_rate"]
+    gap_pp = (opt_hr - baseline_hr) * 100
+    gap_lru_pp = (opt_hr - lru["hit_rate"]) * 100
     print(
-        f"OPT − LRU gap : {gap_pp:+.2f} pp  "
-        f"({'policy-closeable headroom' if gap_pp > 0 else 'LRU already optimal'} "
+        f"OPT − {baseline_name} gap : {gap_pp:+.2f} pp  "
+        f"({'policy-closeable headroom' if gap_pp > 0 else baseline_name + ' already optimal'} "
         f"at {args.budget_gb} GB)"
     )
+    if not is_lru_trace:
+        print(f"OPT − LRU(ref) gap : {gap_lru_pp:+.2f} pp")
     print()
     print(
         f"Optimal capacity  : {opt_cap['min_capacity_gb']:.3f} GB  "
@@ -365,6 +440,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Write JSON report
     # ------------------------------------------------------------------
+    # Base report: identical structure/order to the pre-QSLRU version, so an LRU
+    # run's report is byte-for-byte unchanged. (gap_lru_pp == OPT-LRU gap, which
+    # for an LRU trace is exactly the old gap_pp.) Non-LRU runs append extra keys.
     report = {
         "log": str(log_path),
         "budget_gb": args.budget_gb,
@@ -383,9 +461,15 @@ def main() -> None:
             "tolerance_pp": args.faithfulness_tol,
         },
         "policies": {name: r for name, r in policies},
-        "gap_opt_minus_lru_pp": gap_pp,
+        "gap_opt_minus_lru_pp": gap_lru_pp,
         "opt_capacity": opt_cap,
     }
+    if not is_lru_trace:
+        report["trace_policy"] = trace_policy
+        report["measured"] = measured
+        report["baseline_policy"] = baseline_name
+        report["gap_opt_minus_baseline_pp"] = gap_pp
+        report["lru_faithfulness"]["checked"] = False
     gb_tag = f"{args.budget_gb:g}"
     report_path = log_path.parent / f"belady_report_cpu{gb_tag}.json"
     report_path.write_text(json.dumps(report, indent=2))
