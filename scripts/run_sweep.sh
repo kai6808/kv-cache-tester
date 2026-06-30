@@ -129,6 +129,11 @@ wait_server_ready() {
 # is tee'd into <run>.client.log. Returns the client's exit status.
 run_client() {
     local outdir="$1" logf="$2" cap=$((TEST_DURATION + CLIENT_TIMEOUT_BUFFER))
+    # Optional 3rd stop condition (OR'd with duration/traces). Empty = unlimited.
+    # Set MAX_REQUESTS to cap every run at the same request count for a fair
+    # cross-policy comparison (seed is fixed, so the same N requests run each time).
+    local _max_req=()
+    [[ -n "${MAX_REQUESTS:-}" ]] && _max_req=(--max-requests "$MAX_REQUESTS")
     ( cd "$TESTER_DIR" && \
         timeout --signal=INT "$cap" \
         python3 trace_replay_tester.py \
@@ -142,6 +147,7 @@ run_client() {
             --start-users "$START_USERS" --max-users "$MAX_USERS" \
             --max-traces "$MAX_TRACES" \
             --test-duration "$TEST_DURATION" \
+            "${_max_req[@]}" \
             --server-metrics \
             --timing-strategy "$TIMING_STRATEGY" \
             --trace-seed "$SEED" --prompt-seed "$SEED" --seed "$SEED" \
