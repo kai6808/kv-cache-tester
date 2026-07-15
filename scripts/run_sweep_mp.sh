@@ -99,9 +99,15 @@ build_run_name() {
 }
 
 launch_mp_server() {
-    local policy="$1" cpu="$2" logf="$3"
+    local policy="$1" cpu="$2" logf="$3" outdir="$4"
+    local _access_log_env=()
+    if [[ "${ENABLE_ACCESS_LOG:-0}" == "1" ]]; then
+        mkdir -p "$outdir"
+        _access_log_env=("LMCACHE_ACCESS_LOG=$outdir/cpu_access.jsonl")
+    fi
     setsid env \
         PYTHONHASHSEED=0 \
+        "${_access_log_env[@]}" \
         lmcache server \
             --host "$MP_HOST" --port "$MP_PORT" \
             --http-host "$MP_HTTP_HOST" --http-port "$MP_HTTP_PORT" \
@@ -133,16 +139,29 @@ wait_mp_server_ready() {
 }
 
 launch_server() {
-    local logf="$1"
+    local logf="$1" outdir="$2"
     rm -rf "$PROM_DIR" && mkdir -p "$PROM_DIR"
     local kv_transfer_config
     kv_transfer_config=$(printf '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_load_failure_policy":"%s","kv_connector_extra_config":{"lmcache.mp.port":%s,"lmcache.mp.mq_timeout":%s}}' \
         "$KV_LOAD_FAILURE_POLICY" "$MP_PORT" "$MP_MQ_TIMEOUT")
+    # Routing/scheduling/GPU-eviction logging (Milestone 2b) lives in the vLLM
+    # process, not the MP server — needs its own LMCACHE_ACCESS_LOG, same
+    # convention as launch_mp_server() above. Same base path is fine: each
+    # process's AccessLogSubscriber/lmcache_access_log disambiguates by its
+    # own timestamp+PID (timestamped_pid_path()), so the API-server and each
+    # DP worker each get their own file even though they're handed the same
+    # env var value.
+    local _access_log_env=()
+    if [[ "${ENABLE_ACCESS_LOG:-0}" == "1" ]]; then
+        mkdir -p "$outdir"
+        _access_log_env=("LMCACHE_ACCESS_LOG=$outdir/cpu_access.jsonl")
+    fi
     # setsid => new process group we can kill wholesale (vllm spawns DP workers).
     setsid env \
         PYTHONHASHSEED=0 \
         PROMETHEUS_MULTIPROC_DIR="$PROM_DIR" \
         HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
+        "${_access_log_env[@]}" \
         vllm serve "$MODEL" \
             --host "$HOST" --port "$PORT" \
             --data-parallel-size "$DATA_PARALLEL_SIZE" \
@@ -234,14 +253,14 @@ for policy in "${EVICTION_POLICIES[@]}"; do
         clog="$BASE_OUTPUT_DIR/${run}.client.log"
         log "======== [$n/$total] RUN $run  (policy=$policy cpu=${cpu}GB dp=$DATA_PARALLEL_SIZE) ========"
 
-        launch_mp_server "$policy" "$cpu" "$mplog"
+        launch_mp_server "$policy" "$cpu" "$mplog" "$outdir"
         log "lmcache server launched (pid=$MP_SERVER_PID), waiting for /healthcheck ..."
         if ! wait_mp_server_ready "$mplog"; then
             log "[$n/$total] SKIP $run — lmcache server failed to start."
             stop_mp_server; fail=$((fail + 1)); sleep "$SERVER_SETTLE"; continue
         fi
 
-        launch_server "$slog"
+        launch_server "$slog" "$outdir"
         log "vLLM launched (pid=$SERVER_PID), waiting for /health ..."
         if ! wait_server_ready "$slog"; then
             log "[$n/$total] SKIP $run — vLLM failed to start."
