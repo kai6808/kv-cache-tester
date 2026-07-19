@@ -81,6 +81,7 @@ build_run_name() {
     ctx_k=$((MAX_CONTEXT / 1000))
     pol="$(printf '%s' "$policy" | tr '[:upper:]' '[:lower:]')"
     pol="${pol//:/_}"   # JOINT:LFU_LEAN -> joint_lfu_lean (':' is unsafe in paths)
+    pol="${pol//=/_}"   # :GPU=CPU_BACKED -> _gpu_cpu_backed ('=' is ugly in paths)
     printf '%s%s%sk_%s_cpu%s_%s_%su_%ss' \
         "${RUN_PREFIX:+${RUN_PREFIX}_}" "${rep_tag:+${rep_tag}_}" "$ctx_k" "$gpu_tag" "$cpu" "$pol" "$MAX_USERS" "$TEST_DURATION"
 }
@@ -97,20 +98,30 @@ launch_server() {
     # plus a joint_* LMCACHE_EXTRA_CONFIG JSON (parsed by lmcache config.py).
     # A trailing :SEL (e.g. JOINT:SIZE_AWARE:SEL, JOINT:ADAPTIVE:SEL) turns on
     # Stage B selective offload via joint_selective_offload.
+    # A trailing :GPU or :GPU=<GPU_PRESET> (after :SEL if both, e.g.
+    # JOINT:SIZE_AWARE:SEL:GPU=CPU_BACKED) turns on Stage C joint GPU eviction:
+    # sets LMCACHE_JOINT_GPU_EVICT=1 and, when a preset is named, merges
+    # joint_gpu_preset into the extra-config JSON.
     local policy_name="$policy"
     local _joint_env=()
     if [[ "$policy" == JOINT:* ]]; then
         local joint_variant="${policy#JOINT:}"
-        local joint_selective=""
+        local joint_selective="" joint_gpu=""
+        if [[ "$joint_variant" == *:GPU || "$joint_variant" == *:GPU=* ]]; then
+            local gpu_part="${joint_variant##*:GPU}"   # "" or "=<GPU_PRESET>"
+            joint_variant="${joint_variant%:GPU*}"
+            _joint_env+=(LMCACHE_JOINT_GPU_EVICT=1)
+            [[ "$gpu_part" == =* ]] && joint_gpu=",\"joint_gpu_preset\":\"${gpu_part#=}\""
+        fi
         if [[ "$joint_variant" == *:SEL ]]; then
             joint_variant="${joint_variant%:SEL}"
             joint_selective=',"joint_selective_offload":true'
         fi
         policy_name="JOINT"
         if [[ "$joint_variant" == "ADAPTIVE" ]]; then
-            _joint_env=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"LRU_EQUIV\",\"joint_adapt_enabled\":true$joint_selective}")
+            _joint_env+=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"LRU_EQUIV\",\"joint_adapt_enabled\":true$joint_selective$joint_gpu}")
         else
-            _joint_env=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"$joint_variant\"$joint_selective}")
+            _joint_env+=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"$joint_variant\"$joint_selective$joint_gpu}")
         fi
     fi
     # setsid => new process group we can kill wholesale (vllm spawns workers).
