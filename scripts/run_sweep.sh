@@ -71,6 +71,7 @@ build_run_name() {
     gpu_tag="g$(printf '%s' "$GPU_MEM_UTIL" | tr '.' 'p')"
     ctx_k=$((MAX_CONTEXT / 1000))
     pol="$(printf '%s' "$policy" | tr '[:upper:]' '[:lower:]')"
+    pol="${pol//:/_}"   # JOINT:LFU_LEAN -> joint_lfu_lean (':' is unsafe in paths)
     printf '%s%sk_%s_cpu%s_%s_%su_%ss' \
         "${RUN_PREFIX:+${RUN_PREFIX}_}" "$ctx_k" "$gpu_tag" "$cpu" "$pol" "$MAX_USERS" "$TEST_DURATION"
 }
@@ -83,6 +84,19 @@ launch_server() {
         mkdir -p "$outdir"
         _access_log_env=("LMCACHE_ACCESS_LOG=$outdir/cpu_access.jsonl")
     fi
+    # JOINT:<PRESET> / JOINT:ADAPTIVE combos map to LMCACHE_CACHE_POLICY=JOINT
+    # plus a joint_* LMCACHE_EXTRA_CONFIG JSON (parsed by lmcache config.py).
+    local policy_name="$policy"
+    local _joint_env=()
+    if [[ "$policy" == JOINT:* ]]; then
+        local joint_variant="${policy#JOINT:}"
+        policy_name="JOINT"
+        if [[ "$joint_variant" == "ADAPTIVE" ]]; then
+            _joint_env=(LMCACHE_EXTRA_CONFIG='{"joint_preset":"LRU_EQUIV","joint_adapt_enabled":true}')
+        else
+            _joint_env=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"$joint_variant\"}")
+        fi
+    fi
     # setsid => new process group we can kill wholesale (vllm spawns workers).
     setsid env \
         PYTHONHASHSEED=0 \
@@ -90,7 +104,8 @@ launch_server() {
         LMCACHE_LOCAL_CPU=True \
         LMCACHE_MAX_LOCAL_CPU_SIZE="$cpu" \
         LMCACHE_CHUNK_SIZE="$LMCACHE_CHUNK_SIZE" \
-        LMCACHE_CACHE_POLICY="$policy" \
+        LMCACHE_CACHE_POLICY="$policy_name" \
+        "${_joint_env[@]}" \
         "${_access_log_env[@]}" \
         HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
         vllm serve "$MODEL" \
