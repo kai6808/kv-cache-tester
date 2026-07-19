@@ -86,15 +86,22 @@ launch_server() {
     fi
     # JOINT:<PRESET> / JOINT:ADAPTIVE combos map to LMCACHE_CACHE_POLICY=JOINT
     # plus a joint_* LMCACHE_EXTRA_CONFIG JSON (parsed by lmcache config.py).
+    # A trailing :SEL (e.g. JOINT:SIZE_AWARE:SEL, JOINT:ADAPTIVE:SEL) turns on
+    # Stage B selective offload via joint_selective_offload.
     local policy_name="$policy"
     local _joint_env=()
     if [[ "$policy" == JOINT:* ]]; then
         local joint_variant="${policy#JOINT:}"
+        local joint_selective=""
+        if [[ "$joint_variant" == *:SEL ]]; then
+            joint_variant="${joint_variant%:SEL}"
+            joint_selective=',"joint_selective_offload":true'
+        fi
         policy_name="JOINT"
         if [[ "$joint_variant" == "ADAPTIVE" ]]; then
-            _joint_env=(LMCACHE_EXTRA_CONFIG='{"joint_preset":"LRU_EQUIV","joint_adapt_enabled":true}')
+            _joint_env=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"LRU_EQUIV\",\"joint_adapt_enabled\":true$joint_selective}")
         else
-            _joint_env=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"$joint_variant\"}")
+            _joint_env=(LMCACHE_EXTRA_CONFIG="{\"joint_preset\":\"$joint_variant\"$joint_selective}")
         fi
     fi
     # setsid => new process group we can kill wholesale (vllm spawns workers).
