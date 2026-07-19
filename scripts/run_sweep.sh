@@ -66,18 +66,27 @@ cleanup() { stop_server; }
 trap cleanup EXIT INT TERM
 
 # 0.5 -> g0p5 ; build "64k_g0p5_cpu40_lru_50u_3600s"
+# A '@tag' suffix on a POLICIES entry (e.g. LRU@rep2) is a repeat marker: the
+# tag only prefixes the run name (rep2_64k_...), so one conf can list the same
+# combo twice without run-name collisions. launch_server strips it before
+# interpreting the policy, so the server config is byte-identical to the
+# untagged entry.
 build_run_name() {
-    local policy="$1" cpu="$2" gpu_tag ctx_k pol
+    local policy="$1" cpu="$2" gpu_tag ctx_k pol rep_tag=""
+    if [[ "$policy" == *@* ]]; then
+        rep_tag="${policy##*@}"
+        policy="${policy%@*}"
+    fi
     gpu_tag="g$(printf '%s' "$GPU_MEM_UTIL" | tr '.' 'p')"
     ctx_k=$((MAX_CONTEXT / 1000))
     pol="$(printf '%s' "$policy" | tr '[:upper:]' '[:lower:]')"
     pol="${pol//:/_}"   # JOINT:LFU_LEAN -> joint_lfu_lean (':' is unsafe in paths)
-    printf '%s%sk_%s_cpu%s_%s_%su_%ss' \
-        "${RUN_PREFIX:+${RUN_PREFIX}_}" "$ctx_k" "$gpu_tag" "$cpu" "$pol" "$MAX_USERS" "$TEST_DURATION"
+    printf '%s%s%sk_%s_cpu%s_%s_%su_%ss' \
+        "${RUN_PREFIX:+${RUN_PREFIX}_}" "${rep_tag:+${rep_tag}_}" "$ctx_k" "$gpu_tag" "$cpu" "$pol" "$MAX_USERS" "$TEST_DURATION"
 }
 
 launch_server() {
-    local policy="$1" cpu="$2" logf="$3"
+    local policy="${1%%@*}" cpu="$2" logf="$3"   # strip any @tag repeat marker
     rm -rf "$PROM_DIR" && mkdir -p "$PROM_DIR"
     local _access_log_env=()
     if [[ "${ENABLE_ACCESS_LOG:-0}" == "1" ]]; then
