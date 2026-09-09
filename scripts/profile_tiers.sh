@@ -411,8 +411,19 @@ if window and load_n:
 else:
     out.append(f"L2->L1 load  (SSD->CPU): n={load_n}  total={load_bytes / 1e9:.3f} GB  (window unavailable -- rate not computed)\n")
 if store_n == 0 and load_n == 0:
-    out.append("\nZero L2 (SSD) events: either LMCACHE_LOG_LEVEL=DEBUG wasn't applied, or L1_SIZE_GB\n")
-    out.append("was large enough that nothing spilled to SSD this run -- try lowering L1_SIZE_GB.\n")
+    out.append("\nZero L2 (SSD) events on BOTH sides: either LMCACHE_LOG_LEVEL=DEBUG wasn't applied,\n")
+    out.append("or L1_SIZE_GB never got pressured this run -- check `grep \"L1 memory usage\" \n")
+    out.append("<this>.mpserver.log | tail -20`: if it never crosses the 0.80 watermark, the pool\n")
+    out.append("is too big relative to traffic (lower L1_SIZE_GB, but not below roughly one\n")
+    out.append("max-length request's KV footprint -- going too far the other way causes retrieve\n")
+    out.append("failures instead, a different zero-events outcome).\n")
+elif store_n > 0 and load_n == 0:
+    out.append("\nL1->L2 stores happened but L2->L1 loads are still zero: eviction is firing (check\n")
+    out.append("`grep \"L1 memory usage\" <this>.mpserver.log | tail -20` to confirm it crossed 0.80),\n")
+    out.append("but nothing evicted got re-requested within this run's window. This is a TIMING\n")
+    out.append("problem, not a sizing problem -- shrinking L1_SIZE_GB further won't help. Try a\n")
+    out.append("longer TEST_DURATION, or more concurrent users, so more content both gets evicted\n")
+    out.append("AND gets a chance to be re-requested before the run ends.\n")
 
 with open(summary_path, "w") as f:
     f.writelines(out)
