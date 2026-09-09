@@ -110,8 +110,8 @@ stop_mp_server() {
 # Wipes the SSD/L2 scratch dir. Safe to call unconditionally: SSD_L2_PATH is
 # exclusive to this profile (freshly wiped at launch too, see launch_mp_server)
 # and holds nothing but disposable cache blobs — never the run's real output
-# (logs / tier_metrics_summary.txt / trace_replay_tester.py's HTML+CSV live
-# under $outdir / $BASE_OUTPUT_DIR instead, untouched by this).
+# (logs / tier_metrics_summary.txt / the tester's own HTML+CSV live under
+# $outdir / $BASE_OUTPUT_DIR instead, untouched by this).
 wipe_ssd_scratch() {
     [[ -n "${SSD_L2_PATH:-}" && "$SSD_L2_PATH" != "/" ]] || return 0
     rm -rf "$SSD_L2_PATH"
@@ -123,14 +123,15 @@ wipe_ssd_scratch() {
 cleanup() { stop_server; stop_mp_server; wipe_ssd_scratch; }
 trap cleanup EXIT INT TERM
 
-# 0.5 -> g0p5 ; build "64k_g0p5_dp2_l1_20gb_16u_300s"
+# 0.5 -> g0p5 ; build "8k_g0p5_dp2_l1_20gb_ws500k_c4_300s"
 build_run_name() {
-    local gpu_tag ctx_k
+    local gpu_tag ctx_k ws_k
     gpu_tag="g$(printf '%s' "$GPU_MEM_UTIL" | tr '.' 'p')"
-    ctx_k=$((MAX_CONTEXT / 1000))
-    printf '%s%sk_%s_dp%s_l1_%sgb_%su_%ss' \
+    ctx_k=$((WST_CONTEXT_SIZE / 1000))
+    ws_k=$((WST_MAX_WORKING_SET / 1000))
+    printf '%s%sk_%s_dp%s_l1_%sgb_ws%sk_c%s_%ss' \
         "${RUN_PREFIX:+${RUN_PREFIX}_}" "$ctx_k" "$gpu_tag" "$DATA_PARALLEL_SIZE" \
-        "$L1_SIZE_GB" "$MAX_USERS" "$TEST_DURATION"
+        "$L1_SIZE_GB" "$ws_k" "$WST_FIXED_CONCURRENCY" "$TEST_DURATION"
 }
 
 launch_mp_server() {
@@ -228,30 +229,62 @@ wait_server_ready() {
     return 1
 }
 
-# Runs the client to completion; full terminal output (banner + 'Test Complete')
-# is tee'd into <run>.client.log. Returns the client's exit status.
+# Runs the client to completion; full terminal output is tee'd into
+# <run>.client.log. Returns the client's exit status.
+#
+# 2026-09-09: switched from trace_replay_tester.py to working_set_tester.py
+# after trace_replay's organic (unpredictable) concurrency pattern triggered
+# a real hang in LMCache's small-pool reservation path three attempts
+# running (see profile_tiers.conf's L1 (CPU) history note). working_set_tester
+# is kv-cache-tester's own purpose-built tool for this exact question: it
+# deterministically cycles requests through a working set of WST_MAX_WORKING_SET
+# tokens (round-robin, cache_hit_rate=100 -> always pulled verbatim from the
+# working set), growing from WST_MIN_WORKING_SET up to WST_MAX_WORKING_SET
+# over the course of ONE run via scheduled growth events (both modes only
+# ever test working_set_sizes[-1]; growth to it happens inside the timed
+# run, not as separate combos) -- so TEST_DURATION alone bounds total time,
+# same as before. --mode fixed --fixed-concurrency keeps concurrency
+# constant and LOW throughout (no adaptive ramp-up), specifically to avoid
+# retriggering the reservation-contention hang: a small, fixed number of
+# concurrent requests against a small per-request footprint (WST_CONTEXT_SIZE)
+# is a much smaller simultaneous-reservation footprint against the CPU pool
+# than trace_replay's up-to-64K-token, up-to-16-concurrent pattern was.
+#
+# --force-restart: build_run_name() is deterministic, so a same-conf rerun
+# reuses the same --output-dir. Without this flag, working_set_tester.py's
+# ProgressTracker reads that dir's progress.json and silently SKIPS the
+# (context_size, working_set_size, cache_hit_rate) combo as "already
+# completed" -- a real client exit in seconds, zero traffic, another
+# empty tier_metrics_summary.txt, for a totally different reason than
+# attempts 1-3. Always force a clean run for this profiling use case.
+#
+# --output-tokens: kept short (WST_OUTPUT_TOKENS) on purpose. Decode length
+# doesn't add tier traffic (the KV footprint is fixed by input, not output)
+# but it does dominate wall-clock per request; a short output keeps request
+# throughput high enough that WST_MAX_WORKING_SET's rotation actually laps
+# back around to evicted content before TEST_DURATION runs out.
 run_client() {
     local outdir="$1" logf="$2" cap=$((TEST_DURATION + CLIENT_TIMEOUT_BUFFER))
-    local _max_req=()
-    [[ -n "${MAX_REQUESTS:-}" ]] && _max_req=(--max-requests "$MAX_REQUESTS")
     ( cd "$TESTER_DIR" && \
         timeout --signal=INT "$cap" \
-        python3 trace_replay_tester.py \
+        python3 working_set_tester.py \
             --api-endpoint "http://$HOST:$PORT" \
-            --trace-directory "$TRACE_DIR" \
+            --context-sizes "$WST_CONTEXT_SIZE" \
+            --min-working-set-size "$WST_MIN_WORKING_SET" \
+            --max-working-set-size "$WST_MAX_WORKING_SET" \
+            --working-set-increments "$WST_INCREMENTS" \
+            --cache-hit-rates "$WST_CACHE_HIT_RATE" \
+            --mode fixed \
+            --fixed-concurrency "$WST_FIXED_CONCURRENCY" \
+            --init-concurrency "$WST_INIT_CONCURRENCY" \
+            --assessment-period "$WST_ASSESSMENT_PERIOD" \
+            --test-duration "$TEST_DURATION" \
+            --output-tokens "$WST_OUTPUT_TOKENS" \
+            --force-restart \
             --output-dir "$outdir" \
             --tokenizer "$TOKENIZER" \
-            --max-context "$MAX_CONTEXT" \
             --chunk-size "$CHUNK_SIZE" \
-            --max-concurrent-requests "$MAX_CONCURRENT" \
-            --start-users "$START_USERS" --max-users "$MAX_USERS" \
-            --max-traces "$MAX_TRACES" \
-            --test-duration "$TEST_DURATION" \
-            "${_max_req[@]}" \
-            --server-metrics \
-            --timing-strategy "$TIMING_STRATEGY" \
-            --trace-seed "$SEED" --prompt-seed "$SEED" --seed "$SEED" \
-            --max-ttft "$MAX_TTFT" \
+            --seed "$SEED" \
     ) 2>&1 | tee "$logf"
     return "${PIPESTATUS[0]}"
 }
