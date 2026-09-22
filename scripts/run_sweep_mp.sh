@@ -117,6 +117,7 @@ launch_mp_server() {
             --l1-write-ttl-seconds "$MP_L1_WRITE_TTL_SECONDS" \
             --l1-read-ttl-seconds "$MP_L1_READ_TTL_SECONDS" \
             --eviction-policy "$policy" \
+            ${MP_EXTRA_ARGS[@]+"${MP_EXTRA_ARGS[@]}"} \
             >"$logf" 2>&1 &
     MP_SERVER_PID=$!
     MP_SERVER_PGID="$(ps -o pgid= -p "$MP_SERVER_PID" 2>/dev/null | tr -d ' ')"
@@ -142,8 +143,8 @@ launch_server() {
     local logf="$1" outdir="$2"
     rm -rf "$PROM_DIR" && mkdir -p "$PROM_DIR"
     local kv_transfer_config
-    kv_transfer_config=$(printf '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_load_failure_policy":"%s","kv_connector_extra_config":{"lmcache.mp.port":%s,"lmcache.mp.mq_timeout":%s}}' \
-        "$KV_LOAD_FAILURE_POLICY" "$MP_PORT" "$MP_MQ_TIMEOUT")
+    kv_transfer_config=$(printf '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_load_failure_policy":"%s","kv_connector_extra_config":{"lmcache.mp.port":%s,"lmcache.mp.mq_timeout":%s%s}}' \
+        "$KV_LOAD_FAILURE_POLICY" "$MP_PORT" "$MP_MQ_TIMEOUT" "${KV_EXTRA_CONFIG:-}")
     # Routing/scheduling/GPU-eviction logging (Milestone 2b) lives in the vLLM
     # process, not the MP server — needs its own LMCACHE_ACCESS_LOG, same
     # convention as launch_mp_server() above. Same base path is fine: each
@@ -162,6 +163,7 @@ launch_server() {
         PROMETHEUS_MULTIPROC_DIR="$PROM_DIR" \
         HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
         "${_access_log_env[@]}" \
+        ${VLLM_EXTRA_ENV[@]+"${VLLM_EXTRA_ENV[@]}"} \
         vllm serve "$MODEL" \
             --host "$HOST" --port "$PORT" \
             --data-parallel-size "$DATA_PARALLEL_SIZE" \
@@ -223,6 +225,20 @@ run_client() {
     return "${PIPESTATUS[0]}"
 }
 
+# Optional pass-throughs, defaulted so existing confs are unaffected:
+#   MP_EXTRA_ARGS    extra args appended to `lmcache server`
+#   VLLM_EXTRA_ENV   extra KEY=VAL env entries for `vllm serve`
+#   KV_EXTRA_CONFIG  extra JSON keys spliced into kv_connector_extra_config
+#                    (must start with a comma, e.g. ,"lmcache.mp.foo":true)
+#   RUN_NAME_OVERRIDE  fixed run name instead of the policy x size name
+# NOTE: declare -a preserves an already-set array and creates an empty one
+# otherwise. Do NOT use ("${ARR[@]:-}") -- on an unset array that expands to a
+# single EMPTY STRING, which would pass a blank argv entry to lmcache server.
+declare -a MP_EXTRA_ARGS
+declare -a VLLM_EXTRA_ENV
+: "${KV_EXTRA_CONFIG:=}"
+: "${RUN_NAME_OVERRIDE:=}"
+
 # ---- preflight --------------------------------------------------------------
 command -v curl >/dev/null   || { echo "ERROR: curl required" >&2; exit 1; }
 command -v setsid >/dev/null || { echo "ERROR: setsid required" >&2; exit 1; }
@@ -246,7 +262,7 @@ ok=0; fail=0; n=0
 for policy in "${EVICTION_POLICIES[@]}"; do
     for cpu in "${CPU_SIZES_GB[@]}"; do
         n=$((n + 1))
-        run="$(build_run_name "$policy" "$cpu")"
+        run="${RUN_NAME_OVERRIDE:-$(build_run_name "$policy" "$cpu")}"
         outdir="$BASE_OUTPUT_DIR/$run"
         mplog="$BASE_OUTPUT_DIR/${run}.mpserver.log"
         slog="$BASE_OUTPUT_DIR/${run}.server.log"
