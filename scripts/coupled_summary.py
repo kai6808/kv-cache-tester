@@ -296,7 +296,7 @@ ROWS: list[tuple[str, str, str]] = [
 
 
 MECH_ROWS: list[tuple[str, str, str]] = [
-    ("warmup_ok", "warm-up saw stores flow (1 = yes, must be 1)", "{:.0f}"),
+    ("warmup_ok", "warm-up completed (1 = yes, must be 1)", "{:.0f}"),
     ("stalls", "stalls after warm-up (must be 0)", "{:.0f}"),
     ("engine_deaths", "EngineDeadError after warm-up", "{:.0f}"),
     ("notices_sent", "notices sent (all ranks)", "{:.0f}"),
@@ -432,8 +432,8 @@ def gate(base: Path, arms: list[str]) -> tuple[bool, str]:
         ok = d.get("stalls") is not None and bad == 0
         checks.append((f"no stalls/deaths after warm-up ({arm})", ok, f"{bad:.0f}"))
         checks.append((
-            f"warm-up saw stores flow ({arm})",
-            d.get("warmup_ok") != 0.0,
+            f"warm-up completed ({arm})",
+            d.get("warmup_ok") == 1.0,
             {1.0: "yes", 0.0: "no", None: "n/a"}[d.get("warmup_ok")],
         ))
     p99 = on.get("notice_handler_p99_us")
@@ -459,8 +459,8 @@ def gate(base: Path, arms: list[str]) -> tuple[bool, str]:
 def require_clean(base: Path, arms: list[str]) -> tuple[bool, str]:
     """The smoke verdict: every arm healthy, and every coupling actually live.
 
-    Per arm: the warm-up saw stores flow, and no stalls or engine deaths
-    followed it. Arms that send notices must have sent some and completed GPU
+    Per arm: the warm-up completed, requests completed, and no stalls or
+    engine deaths followed the warm-up. Arms that send notices must have sent some and completed GPU
     chunks. The queued-prefix hash hit ratio is reported as a warning only: a
     short run may queue no follow-up turn whose prefix is already in L1.
 
@@ -471,8 +471,12 @@ def require_clean(base: Path, arms: list[str]) -> tuple[bool, str]:
     for arm in arms:
         d = collect(base, arm)
         bad = (d.get("stalls") or 0) + (d.get("engine_deaths") or 0)
-        rows.append((arm, "warm-up flowed", d.get("warmup_ok") != 0.0,
-                     {1.0: "yes", 0.0: "no", None: "n/a"}[d.get("warmup_ok")]))
+        # Missing data is a failure, never a pass: an arm whose servers did
+        # not start leaves no warm-up status and no completed requests.
+        rows.append((arm, "warm-up completed", d.get("warmup_ok") == 1.0,
+                     {1.0: "yes", 0.0: "no", None: "missing"}[d.get("warmup_ok")]))
+        rows.append((arm, "requests completed", bool(d.get("requests")),
+                     f"{d.get('requests') or 0:.0f}"))
         rows.append((arm, "no stalls/deaths after warm-up",
                      d.get("stalls") is not None and bad == 0, f"{bad:.0f}"))
         if d.get("notices_sent") is not None:
