@@ -3,7 +3,7 @@
 # run_coupled.sh — one file to run the coupled GPU + L1 eviction comparison.
 #
 #   ./scripts/run_coupled.sh [config]          # default: scripts/coupled.conf
-#   ./scripts/run_coupled.sh --smoke [config]  # 1 short arm, proves the wiring
+#   ./scripts/run_coupled.sh --smoke [config]  # every arm, short, real shape
 #
 # Runs each ARM in the config through scripts/run_sweep_mp.sh -- the same
 # orchestration the DP2 collection uses -- then writes a comparison summary.
@@ -25,20 +25,16 @@ CONFIG="${1:-$SCRIPT_DIR/coupled.conf}"
 source "$CONFIG"
 
 if ((SMOKE)); then
-    # Prove the mechanism end to end, cheaply: the fully coupled arm only,
-    # a tiny pool so eviction actually fires.
+    # Every configured arm, short, at the REAL shape: the conf's users,
+    # traces, concurrency and pool size are kept; only the duration shrinks.
     #
-    # These numbers mirror sweep_mp_smoke2.conf, the shape that demonstrably
-    # produces L1 traffic under LRU (8 requests / ~203k prompt tokens ->
-    # 26,160 external hits). Do NOT shorten them: at 180s the run completed
-    # only 2 requests and the pool was queried 25k times but answered 0,
-    # because stores had not yet landed and accumulated. That looks exactly
-    # like a broken coupling and is really just an empty cache.
-    ARMS=("${ARMS[@]: -1}")
-    CPU_SIZES_GB=(5)
+    # Do NOT shrink the load. The old 2-user / 5 GB smoke hit the MP path's
+    # one-time startup stall (present at the pre-coupled commit too) and,
+    # with no other traffic to carry it through, sat there until vLLM's 300 s
+    # RPC timeout killed the engine -- which looked exactly like "the
+    # coupling blocks the engine" (cachelab, 2026-09-23).
     TEST_DURATION="${SMOKE_DURATION:-300}"
-    MAX_REQUESTS="${SMOKE_MAX_REQUESTS:-8}"
-    MAX_USERS="2"; START_USERS="2"; MAX_TRACES="4"; MAX_CONCURRENT="8"
+    MAX_REQUESTS=""
     BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR}_smoke"
 fi
 
@@ -90,14 +86,29 @@ run_arm() {
         printf '"--coupled-tie-break" %q ' "$COUPLED_TIE_BREAK"
         printf ')\n'
 
-        # vLLM-side switch for "GPU evicts L1-backed first".
-        if [[ "$gpu_side" == "1" ]]; then
-            printf 'VLLM_EXTRA_ENV=(LMCACHE_GPU_EVICT_L1_BACKED=1 '
-            printf 'LMCACHE_GPU_EVICT_L1_BACKED_WINDOW=%q ' "$GPU_EVICT_WINDOW"
-            printf 'LMCACHE_CHUNK_SIZE=%q)\n' "$MP_CHUNK_SIZE"
-        else
-            printf 'declare -a VLLM_EXTRA_ENV\n'
-        fi
+        # vLLM-side GPU mode:
+        #   0      nothing on the GPU side
+        #   track  chunk residency tracked and reported (the exclusive term's
+        #          input) but allocation order untouched -- the overhead gate
+        #   1      tracking + "GPU evicts L1-backed first"
+        case "$gpu_side" in
+            1)
+                printf 'VLLM_EXTRA_ENV=(LMCACHE_GPU_EVICT_L1_BACKED=1 '
+                printf 'LMCACHE_GPU_EVICT_L1_BACKED_WINDOW=%q ' "$GPU_EVICT_WINDOW"
+                printf 'LMCACHE_CHUNK_SIZE=%q)\n' "$MP_CHUNK_SIZE"
+                ;;
+            track)
+                printf 'VLLM_EXTRA_ENV=(LMCACHE_GPU_RESIDENCY_TRACK=1 '
+                printf 'LMCACHE_CHUNK_SIZE=%q)\n' "$MP_CHUNK_SIZE"
+                ;;
+            0)
+                printf 'declare -a VLLM_EXTRA_ENV\n'
+                ;;
+            *)
+                echo "ERROR: arm '$name': gpu_side must be 0, track or 1, got '$gpu_side'" >&2
+                return 1
+                ;;
+        esac
 
         # Whether the connector sends demand/residency notices at all.
         if [[ "$demand" == "1" ]]; then
@@ -135,12 +146,17 @@ done
 log "arms complete: $ok ok, $fail failed"
 
 # ---- summary ----------------------------------------------------------------
+# SUMMARY_ARGS (optional, from the conf) is passed through, e.g. (--gate) for
+# notice_gate.conf, which then fails the run unless every gate criterion holds.
+declare -a SUMMARY_ARGS
 log "building comparison summary -> $SUMMARY"
 python3 "$SCRIPT_DIR/coupled_summary.py" \
     --base "$BASE_OUTPUT_DIR" \
     --arms "${RAN[@]:-}" \
-    --out "$SUMMARY" 2>&1 | tee -a "$MASTER_LOG"
+    --out "$SUMMARY" \
+    ${SUMMARY_ARGS[@]+"${SUMMARY_ARGS[@]}"} 2>&1 | tee -a "$MASTER_LOG"
+summary_rc="${PIPESTATUS[0]}"
 
 log "DONE. Summary: $SUMMARY"
 [[ -f "$SUMMARY" ]] && cat "$SUMMARY"
-exit $(( fail > 0 ))
+exit $(( fail > 0 || summary_rc != 0 ))

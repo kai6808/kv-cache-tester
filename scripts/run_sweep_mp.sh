@@ -239,6 +239,85 @@ declare -a VLLM_EXTRA_ENV
 : "${KV_EXTRA_CONFIG:=}"
 : "${RUN_NAME_OVERRIDE:=}"
 
+# Optional warm-up before the measured client (default OFF, so the DP2/DP4
+# collection confs behave exactly as before).
+#
+# Why: the MP path stalls once, for ~100 s, right after the first KV store of
+# a fresh vLLM + lmcache server pair (reproduced 2026-09-23 at the pre-coupled
+# commit, and present in the July collection run). Under load it recovers on
+# its own; left in, it lands in the first wave of every arm's TTFT. The
+# warm-up absorbs it with unmeasured traffic, then clears L1 so every arm
+# starts the measured run from an empty pool.
+#   WARMUP_PROMPTS     concurrent warm-up prompts (0 = off)
+#   WARMUP_TOKENS      approximate prompt length in tokens (one word each)
+#   WARMUP_TIMEOUT     seconds before giving up on the warm-up
+#   WARMUP_MIN_STORES  new "Stored" lines in the MP log that count as flowing
+: "${WARMUP_PROMPTS:=0}"
+: "${WARMUP_TOKENS:=1024}"
+: "${WARMUP_TIMEOUT:=240}"
+: "${WARMUP_MIN_STORES:=4}"
+
+count_stores() { grep -c "Stored" "$1" 2>/dev/null || true; }
+
+# Sends distinct random-word prompts (seeded per index, so never shared with
+# each other or with the traces) and waits until the MP server has logged
+# WARMUP_MIN_STORES new stores or WARMUP_TIMEOUT passes, then clears L1.
+# Returns non-zero if stores never flowed, which the caller logs but does
+# not treat as fatal: the measured run then shows the stall in its stall count.
+run_warmup() {
+    local mplog="$1" outdir="$2"
+    ((WARMUP_PROMPTS > 0)) || return 0
+    local base t0=$SECONDS i rc=0
+    local -a pids=()
+    base=$(count_stores "$mplog")
+    log "warm-up: $WARMUP_PROMPTS concurrent ~${WARMUP_TOKENS}-token prompts (unmeasured) ..."
+    for ((i = 0; i < WARMUP_PROMPTS; i++)); do
+        python3 -c '
+import json, random, sys
+model, n, i = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+rnd = random.Random("cachelab-warmup-" + i)
+words = [w for w in "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu".split()]
+print(json.dumps({"model": model, "max_tokens": 1,
+                  "prompt": " ".join(rnd.choice(words) for _ in range(n))}))
+' "$MODEL" "$WARMUP_TOKENS" "$i" |
+            curl -sS -o /dev/null --max-time "$WARMUP_TIMEOUT" \
+                -H "Content-Type: application/json" -d @- \
+                "http://$HOST:$PORT/v1/completions" &
+        pids+=("$!")
+    done
+    while (( $(count_stores "$mplog") - base < WARMUP_MIN_STORES )); do
+        if ((SECONDS - t0 >= WARMUP_TIMEOUT)); then
+            log "WARN: warm-up saw only $(( $(count_stores "$mplog") - base )) new stores in ${WARMUP_TIMEOUT}s"
+            rc=1
+            break
+        fi
+        sleep "$POLL_INTERVAL"
+    done
+    # Only the warm-up requests: a bare `wait` would also block on the
+    # MP server and vLLM, which this shell started as background jobs.
+    wait "${pids[@]}" 2>/dev/null
+    # The measured window starts here; the summary counts stalls only after
+    # this instant (the warm-up is expected to absorb the startup stall).
+    mkdir -p "$outdir"
+    date -u +%s > "$outdir/warmup_done_epoch"
+    if curl -fsS -o /dev/null -X POST "http://$MP_HTTP_HOST:$MP_HTTP_PORT/clear-cache"; then
+        log "warm-up done in $((SECONDS - t0))s ($(( $(count_stores "$mplog") - base )) stores); L1 cleared"
+    else
+        log "WARN: warm-up done in $((SECONDS - t0))s but /clear-cache failed"
+        rc=1
+    fi
+    return "$rc"
+}
+
+# Snapshot the MP server's /status (demand-plane counters, handler latency,
+# policy metrics) before it is stopped; the coupled summary reads it.
+save_mp_status() {
+    local outdir="$1"
+    mkdir -p "$outdir"
+    curl -fsS "http://$MP_HTTP_HOST:$MP_HTTP_PORT/status" > "$outdir/mp_status.json" ||
+        log "WARN: could not fetch MP /status"
+}
+
 # ---- preflight --------------------------------------------------------------
 command -v curl >/dev/null   || { echo "ERROR: curl required" >&2; exit 1; }
 command -v setsid >/dev/null || { echo "ERROR: setsid required" >&2; exit 1; }
@@ -282,6 +361,7 @@ for policy in "${EVICTION_POLICIES[@]}"; do
             log "[$n/$total] SKIP $run — vLLM failed to start."
             stop_server; stop_mp_server; fail=$((fail + 1)); sleep "$SERVER_SETTLE"; continue
         fi
+        run_warmup "$mplog" "$outdir" || true
         log "servers READY -> running client (log: $clog)"
 
         if run_client "$outdir" "$clog"; then
@@ -292,6 +372,7 @@ for policy in "${EVICTION_POLICIES[@]}"; do
             fail=$((fail + 1))
         fi
 
+        save_mp_status "$outdir"
         stop_server
         stop_mp_server
         log "settling ${SERVER_SETTLE}s for GPU/host-mem release ..."
