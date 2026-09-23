@@ -178,6 +178,7 @@ launch_server() {
             --kv-cache-metrics-sample "$KV_CACHE_METRICS_SAMPLE" \
             --hf-overrides "$HF_OVERRIDES" \
             --kv-transfer-config "$kv_transfer_config" \
+            ${VLLM_EXTRA_ARGS[@]+"${VLLM_EXTRA_ARGS[@]}"} \
             >"$logf" 2>&1 &
     SERVER_PID=$!
     SERVER_PGID="$(ps -o pgid= -p "$SERVER_PID" 2>/dev/null | tr -d ' ')"
@@ -237,6 +238,7 @@ run_client() {
 #                    (must start with a comma, e.g. ,"lmcache.mp.foo":true)
 #   RUN_NAME_OVERRIDE  fixed run name instead of the policy x size name
 #   CLIENT_EXTRA_ARGS  extra args appended to trace_replay_tester.py
+#   VLLM_EXTRA_ARGS    extra args appended to `vllm serve` (every run of a conf)
 # NOTE: declare -a preserves an already-set array and creates an empty one
 # otherwise. Do NOT use ("${ARR[@]:-}") -- on an unset array that expands to a
 # single EMPTY STRING, which would pass a blank argv entry to lmcache server.
@@ -245,6 +247,7 @@ declare -a MP_BASE_ENV
 declare -a VLLM_BASE_ENV
 declare -a VLLM_EXTRA_ENV
 declare -a CLIENT_EXTRA_ARGS
+declare -a VLLM_EXTRA_ARGS
 : "${KV_EXTRA_CONFIG:=}"
 : "${RUN_NAME_OVERRIDE:=}"
 
