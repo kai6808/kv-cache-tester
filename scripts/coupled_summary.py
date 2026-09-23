@@ -3,7 +3,7 @@
 """Build the arm-by-arm comparison for a coupled GPU + L1 eviction round.
 
 Reads what the harness writes -- ``server_metrics.json`` (vLLM and LMCache
-counters), ``summary_trace_replay.csv`` (client-side TTFT and throughput),
+counters), ``detailed_results.csv`` (per-request client TTFT and throughput),
 ``mp_status.json`` (the MP server's demand-plane counters) and the
 ``coupled stats`` lines in each arm's vLLM log -- and emits Markdown tables:
 the results, the change relative to the first arm, and the mechanism (proof
@@ -38,8 +38,6 @@ PROMPT_TOKENS = "vllm:prompt_tokens_total"
 PROMPT_CACHED = "vllm:prompt_tokens_cached_total"
 EXT_HITS = "vllm:external_prefix_cache_hits_total"
 EXT_QUERIES = "vllm:external_prefix_cache_queries_total"
-TTFT_SUM = "vllm:time_to_first_token_seconds_sum"
-TTFT_COUNT = "vllm:time_to_first_token_seconds_count"
 PREFILL_SUM = "vllm:request_prefill_time_seconds_sum"
 PREEMPTIONS = "vllm:num_preemptions_total"
 
@@ -195,9 +193,9 @@ def _mechanism(base: Path, arm: str) -> dict[str, float | None]:
     return out
 
 
-def _client_rows(run_dir: Path) -> list[dict[str, str]]:
-    """Return the per-period client rows, or [] when the file is absent."""
-    path = run_dir / "summary_trace_replay.csv"
+def _request_rows(run_dir: Path) -> list[dict[str, str]]:
+    """Return the client's per-request rows, or [] when the file is absent."""
+    path = run_dir / "detailed_results.csv"
     if not path.is_file():
         return []
     try:
@@ -207,15 +205,18 @@ def _client_rows(run_dir: Path) -> list[dict[str, str]]:
         return []
 
 
+def _pct(sorted_vals: list[float], q: float) -> float | None:
+    """Nearest-rank q-quantile of already-sorted values; None when empty."""
+    if not sorted_vals:
+        return None
+    return sorted_vals[min(len(sorted_vals) - 1, int(q * len(sorted_vals)))]
+
+
 def _f(row: dict[str, str], key: str) -> float | None:
     try:
         return float(row[key])
     except (KeyError, TypeError, ValueError):
         return None
-
-
-def _mean(values: list[float]) -> float | None:
-    return statistics.fmean(values) if values else None
 
 
 def _ratio(num: float | None, den: float | None) -> float | None:
@@ -236,33 +237,38 @@ def collect(base: Path, arm: str) -> dict[str, float | None]:
     """
     run_dir = base / arm
     c = _final_counters(run_dir)
-    rows = _client_rows(run_dir)
 
-    ttft_count = c.get(TTFT_COUNT)
     prompt = c.get(PROMPT_TOKENS)
     elapsed = c.get("_elapsed") or None
 
-    p50 = _mean([v for r in rows if (v := _f(r, "ttft_p50")) is not None])
-    p95 = _mean([v for r in rows if (v := _f(r, "ttft_p95")) is not None])
-    out_tps = _mean([v for r in rows if (v := _f(r, "output_tokens_per_second")) is not None])
-    rps = _mean([v for r in rows if (v := _f(r, "requests_per_second")) is not None])
-    completed = max(
-        (v for r in rows if (v := _f(r, "requests_completed")) is not None),
-        default=None,
-    )
-
+    # Client-side numbers come from the per-request log, not the 30-second
+    # period rows: a percentile averaged over periods is not a percentile, and
+    # the periods' request counts must be summed, not maxed.
+    reqs = _request_rows(run_dir)
+    ok = [r for r in reqs if r.get("success") == "True"]
+    ttfts = sorted(v for r in ok if (v := _f(r, "ttft")) is not None)
+    starts = [v for r in reqs if (v := _f(r, "request_start_time")) is not None]
+    ends = [v for r in ok if (v := _f(r, "request_complete_time")) is not None]
+    window = (max(ends) - min(starts)) if starts and ends else None
+    out_tokens = sum(v for r in ok if (v := _f(r, "output_tokens_actual")) is not None)
+    completed = float(len(ok)) if reqs else None
+    failed = float(len(reqs) - len(ok)) if reqs else None
     return {
         **_health(base, arm),
         **_mechanism(base, arm),
-        # Client-observed latency: what a user feels.
-        "ttft_mean_s": (c[TTFT_SUM] / ttft_count) if ttft_count else None,
-        "ttft_p50_s": p50,
-        "ttft_p95_s": p95,
+        # Client-observed latency over every successful request: what a user feels.
+        "ttft_mean_s": statistics.fmean(ttfts) if ttfts else None,
+        "ttft_p50_s": _pct(ttfts, 0.50),
+        "ttft_p90_s": _pct(ttfts, 0.90),
+        "ttft_p95_s": _pct(ttfts, 0.95),
+        "ttft_p99_s": _pct(ttfts, 0.99),
+        "ttft_over_30s": float(sum(t > 30.0 for t in ttfts)) if ttfts else None,
         # Work done in the fixed wall-clock window.
         "requests": completed,
+        "failed": failed,
         "prompt_tokens": prompt,
-        "out_tok_per_s": out_tps,
-        "req_per_s": rps,
+        "out_tok_per_s": (out_tokens / window) if window else None,
+        "req_per_s": (completed / window) if completed and window else None,
         # Per-tier reuse. GPU = vLLM's own prefix cache over prompt tokens;
         # L1 = the shared pool answering what the GPU missed.
         "gpu_hit_pct": _ratio(c.get(PROMPT_CACHED), prompt),
@@ -281,8 +287,12 @@ def collect(base: Path, arm: str) -> dict[str, float | None]:
 ROWS: list[tuple[str, str, str]] = [
     ("ttft_mean_s", "TTFT mean (s)", "{:.2f}"),
     ("ttft_p50_s", "TTFT p50 (s)", "{:.2f}"),
+    ("ttft_p90_s", "TTFT p90 (s)", "{:.2f}"),
     ("ttft_p95_s", "TTFT p95 (s)", "{:.2f}"),
+    ("ttft_p99_s", "TTFT p99 (s)", "{:.2f}"),
+    ("ttft_over_30s", "requests with TTFT > 30 s", "{:.0f}"),
     ("requests", "requests completed", "{:.0f}"),
+    ("failed", "requests failed", "{:.0f}"),
     ("prompt_tokens", "prompt tokens", "{:.0f}"),
     ("out_tok_per_s", "output tok/s", "{:.1f}"),
     ("req_per_s", "requests/s", "{:.3f}"),
