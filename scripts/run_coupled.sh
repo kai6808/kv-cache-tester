@@ -28,11 +28,9 @@ if ((SMOKE)); then
     # Every configured arm, short, at the REAL shape: the conf's users,
     # traces, concurrency and pool size are kept; only the duration shrinks.
     #
-    # Do NOT shrink the load. The old 2-user / 5 GB smoke hit the MP path's
-    # one-time startup stall (present at the pre-coupled commit too) and,
-    # with no other traffic to carry it through, sat there until vLLM's 300 s
-    # RPC timeout killed the engine -- which looked exactly like "the
-    # coupling blocks the engine" (cachelab, 2026-09-23).
+    # Keep the real load: a 2-user smoke is not what the real round runs, and
+    # it is where the (since fixed) MP event-destroy hang went unnoticed as
+    # "the coupling blocks the engine" (cachelab design doc section 11).
     TEST_DURATION="${SMOKE_DURATION:-300}"
     MAX_REQUESTS=""
     BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR}_smoke"

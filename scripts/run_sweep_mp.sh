@@ -108,6 +108,7 @@ launch_mp_server() {
     setsid env \
         PYTHONHASHSEED=0 \
         "${_access_log_env[@]}" \
+        ${MP_BASE_ENV[@]+"${MP_BASE_ENV[@]}"} \
         lmcache server \
             --host "$MP_HOST" --port "$MP_PORT" \
             --http-host "$MP_HTTP_HOST" --http-port "$MP_HTTP_PORT" \
@@ -228,6 +229,7 @@ run_client() {
 
 # Optional pass-throughs, defaulted so existing confs are unaffected:
 #   MP_EXTRA_ARGS    extra args appended to `lmcache server`
+#   MP_BASE_ENV      KEY=VAL env entries for `lmcache server` in every run of a conf
 #   VLLM_BASE_ENV    KEY=VAL env entries for `vllm serve` in EVERY run of a conf
 #   VLLM_EXTRA_ENV   extra KEY=VAL env entries for `vllm serve` (per arm)
 #   KV_EXTRA_CONFIG  extra JSON keys spliced into kv_connector_extra_config
@@ -237,6 +239,7 @@ run_client() {
 # otherwise. Do NOT use ("${ARR[@]:-}") -- on an unset array that expands to a
 # single EMPTY STRING, which would pass a blank argv entry to lmcache server.
 declare -a MP_EXTRA_ARGS
+declare -a MP_BASE_ENV
 declare -a VLLM_BASE_ENV
 declare -a VLLM_EXTRA_ENV
 : "${KV_EXTRA_CONFIG:=}"
@@ -245,12 +248,11 @@ declare -a VLLM_EXTRA_ENV
 # Optional warm-up before the measured client (default OFF, so the DP2/DP4
 # collection confs behave exactly as before).
 #
-# Why: each vLLM worker stalls once, ~150-160 s, on its first launch of the
-# sampler's top-k/top-p sort kernel -- ROCm loads that code object lazily and
-# amd_comgr parses it at 100% CPU (rocgdb, 2026-09-23; present at the
-# pre-coupled commit and in the July collection run). Left in, it lands in the
-# first wave of every arm's TTFT. The warm-up pays it with unmeasured traffic,
-# then clears L1 so every arm starts the measured run from an empty pool.
+# Why: before lmcache 5031626e the first KV stores of a fresh vLLM + lmcache
+# server pair could hang for ~150 s or for ever (an interprocess GPU event
+# destroyed by the worker and the server at once blocks both on ROCm). The fix
+# removed it; the warm-up stays as a sanity check that stores flow, and clears
+# L1 so every arm starts the measured run from an empty pool.
 #   WARMUP_PROMPTS     concurrent warm-up prompts (0 = off)
 #   WARMUP_TOKENS      approximate prompt length in tokens (one word each)
 #   WARMUP_TIMEOUT     seconds each warm-up request may take

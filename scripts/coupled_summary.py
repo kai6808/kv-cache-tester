@@ -104,8 +104,8 @@ def _health(base: Path, arm: str) -> dict[str, float | None]:
     """Stalls and engine deaths in the measured window of one arm.
 
     A stall is vLLM's 60-second "No available shared memory broadcast block"
-    warning. The one-time startup stall is expected during the warm-up and is
-    excluded; any stall after it is a real finding.
+    warning. Stalls during the warm-up are excluded (it exists to surface them
+    without polluting the measured window); any stall after it is a finding.
     """
     try:
         status = (base / arm / "warmup_status").read_text().strip()
