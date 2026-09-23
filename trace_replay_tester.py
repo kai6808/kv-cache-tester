@@ -20,6 +20,7 @@ import os
 import sys
 import time
 import random
+import zlib
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -314,6 +315,10 @@ class TestConfig:
     # the run stops as soon as ANY set limit trips; only set limits are checked.
     max_requests: Optional[int] = None  # stop after N completed requests (incl. sub-agent turns)
     max_traces: Optional[int] = None    # run only the first N distinct trace files, to completion
+    # Session-sticky DP routing: >0 pins every request of a conversation to DP
+    # rank crc32(conversation id) % dp_affinity via vLLM's X-data-parallel-rank
+    # header. 0 (default) leaves routing to vLLM's load-based DP router.
+    dp_affinity: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1701,7 +1706,8 @@ class APIClient:
     async def send_request(self, messages: List[dict], max_tokens: int, stream: bool = True,
                            on_first_token: Optional[callable] = None,
                            on_chunk: Optional[callable] = None,
-                           tokenizer=None) -> dict:
+                           tokenizer=None,
+                           extra_headers: Optional[Dict[str, str]] = None) -> dict:
         """
         Send request and return metrics.
 
@@ -1725,6 +1731,8 @@ class APIClient:
 
         try:
             params = self._build_request_params(messages, max_tokens, stream)
+            if extra_headers:
+                params["extra_headers"] = extra_headers
 
             if stream:
                 response = await self.client.chat.completions.create(**params)
@@ -2713,6 +2721,21 @@ class TestOrchestrator:
                 logger.warning(f"{Colors.WARNING}  ⚠️ Max concurrent requests limit ({self.config.max_concurrent_requests}) "
                               f"may be constraining throughput. Consider increasing --max-concurrent-requests{Colors.ENDC}")
 
+    def _dp_affinity_headers(self, user: UserSession) -> Optional[Dict[str, str]]:
+        """Pin a conversation to one DP rank (--dp-affinity), else None.
+
+        A sub-agent follows its parent, so the prefix they share lands on the
+        same GPU. crc32 is stable across processes (unlike hash()).
+        """
+        n = self.config.dp_affinity
+        if n <= 0:
+            return None
+        root = user
+        while root.parent_user_id and root.parent_user_id in self.users:
+            root = self.users[root.parent_user_id]
+        rank = zlib.crc32(root.trace_id.encode()) % n
+        return {"X-data-parallel-rank": str(rank)}
+
     async def run_user_request(self, user: UserSession, queue_time: float = 0.0) -> Optional[RequestMetrics]:
         """Execute a single request for a user"""
         request = user.get_next_request()
@@ -2765,7 +2788,8 @@ class TestOrchestrator:
                 stream=stream,
                 on_first_token=on_first_token,
                 on_chunk=on_chunk,
-                tokenizer=self.generator.tokenizer
+                tokenizer=self.generator.tokenizer,
+                extra_headers=self._dp_affinity_headers(user),
             )
 
             # Decrement decode counter if first token was received
@@ -3954,6 +3978,10 @@ def parse_arguments():
                         help="Backoff duration in seconds when a user is rate limited (default: 30)")
 
     # Admission control (legacy)
+    parser.add_argument("--dp-affinity", type=int, default=0,
+                        help="Session-sticky DP routing: pin each conversation to DP rank "
+                             "crc32(conversation id) %% N via vLLM's X-data-parallel-rank header. "
+                             "Default 0 = vLLM's own load-based DP routing.")
     parser.add_argument("--max-concurrent-requests", type=int, default=0,
                         help="Max concurrent in-flight requests (admission control). "
                              "When reached, new dispatches are blocked until requests complete. "
@@ -4058,6 +4086,7 @@ async def main():
         ttft_window=args.ttft_window,
         rate_limit_backoff=args.rate_limit_backoff,
         max_concurrent_requests=args.max_concurrent_requests,
+        dp_affinity=args.dp_affinity,
         warm_prefix_pct=args.warm_prefix_pct,
         advance_min=args.advance_min,
         advance_max=args.advance_max,

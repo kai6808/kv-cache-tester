@@ -223,6 +223,7 @@ run_client() {
             --timing-strategy "$TIMING_STRATEGY" \
             --trace-seed "$SEED" --prompt-seed "$SEED" --seed "$SEED" \
             --max-ttft "$MAX_TTFT" \
+            ${CLIENT_EXTRA_ARGS[@]+"${CLIENT_EXTRA_ARGS[@]}"} \
     ) 2>&1 | tee "$logf"
     return "${PIPESTATUS[0]}"
 }
@@ -235,6 +236,7 @@ run_client() {
 #   KV_EXTRA_CONFIG  extra JSON keys spliced into kv_connector_extra_config
 #                    (must start with a comma, e.g. ,"lmcache.mp.foo":true)
 #   RUN_NAME_OVERRIDE  fixed run name instead of the policy x size name
+#   CLIENT_EXTRA_ARGS  extra args appended to trace_replay_tester.py
 # NOTE: declare -a preserves an already-set array and creates an empty one
 # otherwise. Do NOT use ("${ARR[@]:-}") -- on an unset array that expands to a
 # single EMPTY STRING, which would pass a blank argv entry to lmcache server.
@@ -242,6 +244,7 @@ declare -a MP_EXTRA_ARGS
 declare -a MP_BASE_ENV
 declare -a VLLM_BASE_ENV
 declare -a VLLM_EXTRA_ENV
+declare -a CLIENT_EXTRA_ARGS
 : "${KV_EXTRA_CONFIG:=}"
 : "${RUN_NAME_OVERRIDE:=}"
 
