@@ -163,6 +163,7 @@ launch_server() {
         PROMETHEUS_MULTIPROC_DIR="$PROM_DIR" \
         HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" \
         "${_access_log_env[@]}" \
+        ${VLLM_BASE_ENV[@]+"${VLLM_BASE_ENV[@]}"} \
         ${VLLM_EXTRA_ENV[@]+"${VLLM_EXTRA_ENV[@]}"} \
         vllm serve "$MODEL" \
             --host "$HOST" --port "$PORT" \
@@ -227,7 +228,9 @@ run_client() {
 
 # Optional pass-throughs, defaulted so existing confs are unaffected:
 #   MP_EXTRA_ARGS    extra args appended to `lmcache server`
-#   VLLM_EXTRA_ENV   extra KEY=VAL env entries for `vllm serve`
+#   VLLM_BASE_ENV    KEY=VAL env entries for `vllm serve` in EVERY run of a conf
+#                    (e.g. HIP_ENABLE_DEFERRED_LOADING=0 in coupled.conf)
+#   VLLM_EXTRA_ENV   extra KEY=VAL env entries for `vllm serve` (per arm)
 #   KV_EXTRA_CONFIG  extra JSON keys spliced into kv_connector_extra_config
 #                    (must start with a comma, e.g. ,"lmcache.mp.foo":true)
 #   RUN_NAME_OVERRIDE  fixed run name instead of the policy x size name
@@ -235,6 +238,7 @@ run_client() {
 # otherwise. Do NOT use ("${ARR[@]:-}") -- on an unset array that expands to a
 # single EMPTY STRING, which would pass a blank argv entry to lmcache server.
 declare -a MP_EXTRA_ARGS
+declare -a VLLM_BASE_ENV
 declare -a VLLM_EXTRA_ENV
 : "${KV_EXTRA_CONFIG:=}"
 : "${RUN_NAME_OVERRIDE:=}"
@@ -297,9 +301,10 @@ print(json.dumps({"model": model, "max_tokens": 1,
     # MP server and vLLM, which this shell started as background jobs.
     wait "${pids[@]}" 2>/dev/null
     # The measured window starts here; the summary counts stalls only after
-    # this instant (the warm-up is expected to absorb the startup stall).
+    # this instant, and fails the run if the warm-up never saw stores flow.
     mkdir -p "$outdir"
     date -u +%s > "$outdir/warmup_done_epoch"
+    if ((rc == 0)); then echo ok; else echo timeout; fi > "$outdir/warmup_status"
     if curl -fsS -o /dev/null -X POST "http://$MP_HTTP_HOST:$MP_HTTP_PORT/clear-cache"; then
         log "warm-up done in $((SECONDS - t0))s ($(( $(count_stores "$mplog") - base )) stores); L1 cleared"
     else

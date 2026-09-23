@@ -36,6 +36,9 @@ if ((SMOKE)); then
     TEST_DURATION="${SMOKE_DURATION:-300}"
     MAX_REQUESTS=""
     BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR}_smoke"
+    # The smoke fails (non-zero exit) unless every arm's warm-up flowed, no
+    # stall or engine death followed it, and the notice arms were live.
+    SMOKE_SUMMARY_ARGS=(--require-clean)
 fi
 
 mkdir -p "$BASE_OUTPUT_DIR"
@@ -148,7 +151,8 @@ log "arms complete: $ok ok, $fail failed"
 # ---- summary ----------------------------------------------------------------
 # SUMMARY_ARGS (optional, from the conf) is passed through, e.g. (--gate) for
 # notice_gate.conf, which then fails the run unless every gate criterion holds.
-declare -a SUMMARY_ARGS
+declare -a SUMMARY_ARGS SMOKE_SUMMARY_ARGS
+SUMMARY_ARGS+=(${SMOKE_SUMMARY_ARGS[@]+"${SMOKE_SUMMARY_ARGS[@]}"})
 log "building comparison summary -> $SUMMARY"
 python3 "$SCRIPT_DIR/coupled_summary.py" \
     --base "$BASE_OUTPUT_DIR" \

@@ -107,9 +107,14 @@ def _health(base: Path, arm: str) -> dict[str, float | None]:
     warning. The one-time startup stall is expected during the warm-up and is
     excluded; any stall after it is a real finding.
     """
+    try:
+        status = (base / arm / "warmup_status").read_text().strip()
+        warmup_ok: float | None = 1.0 if status == "ok" else 0.0
+    except OSError:
+        warmup_ok = None  # no warm-up configured
     log = base / f"{arm}.server.log"
     if not log.is_file():
-        return {"stalls": None, "engine_deaths": None}
+        return {"stalls": None, "engine_deaths": None, "warmup_ok": warmup_ok}
     start = _warmup_epoch(base / arm)
     year = datetime.fromtimestamp(start or 0, tz=timezone.utc).year if start else 1970
     stalls = deaths = 0
@@ -124,7 +129,7 @@ def _health(base: Path, arm: str) -> dict[str, float | None]:
             stalls += 1
         else:
             deaths += 1
-    return {"stalls": stalls, "engine_deaths": deaths}
+    return {"stalls": stalls, "engine_deaths": deaths, "warmup_ok": warmup_ok}
 
 
 def _mechanism(base: Path, arm: str) -> dict[str, float | None]:
@@ -291,6 +296,7 @@ ROWS: list[tuple[str, str, str]] = [
 
 
 MECH_ROWS: list[tuple[str, str, str]] = [
+    ("warmup_ok", "warm-up saw stores flow (1 = yes, must be 1)", "{:.0f}"),
     ("stalls", "stalls after warm-up (must be 0)", "{:.0f}"),
     ("engine_deaths", "EngineDeadError after warm-up", "{:.0f}"),
     ("notices_sent", "notices sent (all ranks)", "{:.0f}"),
@@ -425,6 +431,11 @@ def gate(base: Path, arms: list[str]) -> tuple[bool, str]:
         bad = (d.get("stalls") or 0) + (d.get("engine_deaths") or 0)
         ok = d.get("stalls") is not None and bad == 0
         checks.append((f"no stalls/deaths after warm-up ({arm})", ok, f"{bad:.0f}"))
+        checks.append((
+            f"warm-up saw stores flow ({arm})",
+            d.get("warmup_ok") != 0.0,
+            {1.0: "yes", 0.0: "no", None: "n/a"}[d.get("warmup_ok")],
+        ))
     p99 = on.get("notice_handler_p99_us")
     checks.append((
         f"handler p99 < {GATE_HANDLER_P99_US:.0f} us",
@@ -445,11 +456,54 @@ def gate(base: Path, arms: list[str]) -> tuple[bool, str]:
     return passed, "\n".join(lines) + "\n"
 
 
+def require_clean(base: Path, arms: list[str]) -> tuple[bool, str]:
+    """The smoke verdict: every arm healthy, and every coupling actually live.
+
+    Per arm: the warm-up saw stores flow, and no stalls or engine deaths
+    followed it. Arms that send notices must have sent some and completed GPU
+    chunks. The queued-prefix hash hit ratio is reported as a warning only: a
+    short run may queue no follow-up turn whose prefix is already in L1.
+
+    Returns:
+        (passed, Markdown section).
+    """
+    rows: list[tuple[str, str, bool, str]] = []
+    for arm in arms:
+        d = collect(base, arm)
+        bad = (d.get("stalls") or 0) + (d.get("engine_deaths") or 0)
+        rows.append((arm, "warm-up flowed", d.get("warmup_ok") != 0.0,
+                     {1.0: "yes", 0.0: "no", None: "n/a"}[d.get("warmup_ok")]))
+        rows.append((arm, "no stalls/deaths after warm-up",
+                     d.get("stalls") is not None and bad == 0, f"{bad:.0f}"))
+        if d.get("notices_sent") is not None:
+            rows.append((arm, "notices sent", bool(d.get("notices_sent")),
+                         f"{d.get('notices_sent'):.0f}"))
+            rows.append((arm, "GPU chunks completed", bool(d.get("chunks_completed")),
+                         f"{d.get('chunks_completed') or 0:.0f}"))
+            hit = d.get("waiting_hash_in_l1_pct")
+            rows.append((arm, "queued-prefix hashes found in L1 (warning only)", True,
+                         "n/a" if hit is None else f"{hit:.1f}%"))
+    passed = all(ok for _, _, ok, _ in rows)
+    lines = [
+        f"## Smoke verdict -- {'PASS' if passed else 'FAIL'}",
+        "",
+        "| arm | check | result | value |",
+        "|---|---|---|---|",
+    ]
+    lines += [f"| {a} | {c} | {'PASS' if ok else 'FAIL'} | {v} |" for a, c, ok, v in rows]
+    return passed, "\n".join(lines) + "\n"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", required=True, type=Path)
     ap.add_argument("--arms", nargs="*", default=[])
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="smoke verdict: exit 1 unless every arm is healthy and live",
+    )
     ap.add_argument(
         "--gate",
         action="store_true",
@@ -466,8 +520,14 @@ def main() -> None:
 
     text = render(args.base, arms)
     passed = True
+    if args.require_clean:
+        ok, section = require_clean(args.base, arms)
+        passed = passed and ok
+        text += "\n" + section
+        print(section)
     if args.gate:
-        passed, section = gate(args.base, arms)
+        ok, section = gate(args.base, arms)
+        passed = passed and ok
         text += "\n" + section
         print(section)
     args.out.write_text(text)
