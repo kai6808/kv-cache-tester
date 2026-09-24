@@ -13,7 +13,7 @@ cached tokens.
 Per-request `cached_tokens` = GPU + L1 hits together; the split comes from
 the vLLM counters over the same window (30 s snapshots, nearest after).
 """
-import csv, json, statistics as st, sys
+import csv, json, os, re, statistics as st, sys
 csv.field_size_limit(10**9)
 N = int(sys.argv[1])
 arms = [a.split("=", 1) for a in sys.argv[2:]]
@@ -43,6 +43,24 @@ for name, d in arms:
         st_ = {"od": ec.get("eviction_on_demand"), "oom": ec.get("store_oom_keys"),
                "od_ev": ec.get("on_demand_evicted"),
                "l1_use": ms["storage_manager"]["l1_manager"]["memory_usage_ratio"]}
+    except Exception:
+        pass
+    # L1 eviction volume over the whole run, the same way for every policy
+    # (LRU reports no eviction count): chunks stored minus chunks resident at
+    # the end, from the arm's MP-server log next to its dir. Includes the ~25
+    # warm-up chunks cleared before the measured client starts.
+    try:
+        chunk = json.load(open(f"{d}/mp_status.json"))["chunk_size"]
+        stored = trig = 0
+        for line in open(os.path.join(os.path.dirname(d), os.path.basename(d) + ".mpserver.log")):
+            m = re.search(r"Stored (\d+) tokens", line)
+            if m:
+                stored += int(m.group(1)) // chunk
+            elif "triggering eviction" in line:
+                trig += 1
+        l1 = ms["storage_manager"]["l1_manager"]
+        cap = l1["total_object_count"] / max(l1["memory_usage_ratio"], 1e-9)
+        st_.update(ev=stored - l1["total_object_count"], trig=trig, turn=(stored - l1["total_object_count"]) / cap)
     except Exception:
         pass
     W[name] = dict(win_s=t_end - t0, gpu=100 * g / p, l1=100 * e / p, all=100 * (g + e) / p,
@@ -87,6 +105,10 @@ row("prompt tok/s (window)", lambda n: sum(float(r["server_prompt_tokens"] or 0)
     "{:16.0f}")
 row("client elapsed, all requests (s)", lambda n: W[n]["elapsed_s"], "{:16.0f}")
 row("vLLM preemptions (window)", lambda n: W[n]["preempt"], "{:16.0f}")
+row("L1 chunks evicted (run)", lambda n: str(W[n].get("ev", "-")), "{:>16}")
+row("L1 turnovers (evicted / capacity)", lambda n: ("%.1f" % W[n]["turn"]) if "turn" in W[n] else "-", "{:>16}")
+row("L1 watermark eviction rounds", lambda n: str(W[n].get("trig", "-")), "{:>16}")
+row("L1 on-demand evictions (chunks)", lambda n: str(W[n].get("od_ev", "-")), "{:>16}")
 row("L1 on-demand eviction", lambda n: str(W[n].get("od", "-")), "{:>16}")
 row("stores dropped (L1 full, end)", lambda n: str(W[n].get("oom", "-")), "{:>16}")
 row("L1 usage at end", lambda n: ("%.2f" % W[n]["l1_use"]) if "l1_use" in W[n] else "-", "{:>16}")
