@@ -28,6 +28,7 @@ for name, d in arms:
                   key=lambda r: float(r["request_complete_time"]))
     t0 = min(float(r["request_start_time"]) for r in rows)
     t_end = float(rows[min(N, len(rows)) - 1]["request_complete_time"])
+    elapsed = float(rows[-1]["request_complete_time"]) - t0
     R[name] = rows[:N]
     snaps = json.load(open(f"{d}/server_metrics.json"))
     s1 = next((s for s in snaps if s["wall_time"] >= t_end), snaps[-1])
@@ -45,13 +46,14 @@ for name, d in arms:
     except Exception:
         pass
     W[name] = dict(win_s=t_end - t0, gpu=100 * g / p, l1=100 * e / p, all=100 * (g + e) / p,
-                   preempt=dd("vllm:num_preemptions_total"), **st_)
+                   preempt=dd("vllm:num_preemptions_total"), elapsed_s=elapsed, **st_)
 
 key = lambda r: (r["trace_id"], r["request_idx"])
 common = set.intersection(*[set(map(key, R[n])) for n, _ in arms])
 M = {n: [r for r in R[n] if key(r) in common] for n, _ in arms}
 names = [n for n, _ in arms]
 print(f"window = first {N} completed requests per arm; identical requests in every arm: {len(common)}")
+print("latency rows use the identical requests; throughput rows use each arm's whole window")
 print(f"{'':34}" + "".join(f"{n:>16}" for n in names))
 def row(label, f, fmt):
     print(f"{label:34}" + "".join(fmt.format(f(n)) for n in names))
@@ -68,8 +70,22 @@ tt = lambda n: [float(r["ttft"]) for r in M[n]]
 row("TTFT mean (s)", lambda n: st.mean(tt(n)), "{:16.2f}")
 row("TTFT p50 (s)", lambda n: pct(tt(n), 50), "{:16.2f}")
 row("TTFT p99 (s)", lambda n: pct(tt(n), 99), "{:16.2f}")
-row("TPOT mean (ms)", lambda n: st.mean([(float(r["ttlt"]) - float(r["ttft"])) / (int(r["output_tokens_actual"]) - 1) * 1000
-    for r in M[n] if int(r["output_tokens_actual"] or 0) > 1]), "{:16.1f}")
+tp = lambda n: [(float(r["ttlt"]) - float(r["ttft"])) / (int(r["output_tokens_actual"]) - 1) * 1000
+                 for r in M[n] if int(r["output_tokens_actual"] or 0) > 1]
+row("TPOT mean (ms)", lambda n: st.mean(tp(n)), "{:16.1f}")
+row("TPOT p50 (ms)", lambda n: pct(tp(n), 50), "{:16.1f}")
+row("TPOT p99 (ms)", lambda n: pct(tp(n), 99), "{:16.1f}")
+e2e = lambda n: [float(r["ttlt"]) for r in M[n]]
+row("E2E latency mean (s)", lambda n: st.mean(e2e(n)), "{:16.2f}")
+row("E2E latency p50 (s)", lambda n: pct(e2e(n), 50), "{:16.2f}")
+row("E2E latency p99 (s)", lambda n: pct(e2e(n), 99), "{:16.2f}")
+# Throughput over each arm's own window (all N requests, not just identical).
+row("requests/min (window)", lambda n: 60 * len(R[n]) / W[n]["win_s"], "{:16.2f}")
+row("output tok/s (window)", lambda n: sum(int(r["output_tokens_actual"] or 0) for r in R[n]) / W[n]["win_s"],
+    "{:16.1f}")
+row("prompt tok/s (window)", lambda n: sum(float(r["server_prompt_tokens"] or 0) for r in R[n]) / W[n]["win_s"],
+    "{:16.0f}")
+row("client elapsed, all requests (s)", lambda n: W[n]["elapsed_s"], "{:16.0f}")
 row("vLLM preemptions (window)", lambda n: W[n]["preempt"], "{:16.0f}")
 row("L1 on-demand eviction", lambda n: str(W[n].get("od", "-")), "{:>16}")
 row("stores dropped (L1 full, end)", lambda n: str(W[n].get("oom", "-")), "{:>16}")
