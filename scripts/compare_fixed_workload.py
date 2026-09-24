@@ -44,7 +44,8 @@ for name, d in arms:
                "l1_use": ms["storage_manager"]["l1_manager"]["memory_usage_ratio"]}
     except Exception:
         pass
-    W[name] = dict(win_s=t_end - t0, gpu=100 * g / p, l1=100 * e / p, all=100 * (g + e) / p, **st_)
+    W[name] = dict(win_s=t_end - t0, gpu=100 * g / p, l1=100 * e / p, all=100 * (g + e) / p,
+                   preempt=dd("vllm:num_preemptions_total"), **st_)
 
 key = lambda r: (r["trace_id"], r["request_idx"])
 common = set.intersection(*[set(map(key, R[n])) for n, _ in arms])
@@ -69,6 +70,7 @@ row("TTFT p50 (s)", lambda n: pct(tt(n), 50), "{:16.2f}")
 row("TTFT p99 (s)", lambda n: pct(tt(n), 99), "{:16.2f}")
 row("TPOT mean (ms)", lambda n: st.mean([(float(r["ttlt"]) - float(r["ttft"])) / (int(r["output_tokens_actual"]) - 1) * 1000
     for r in M[n] if int(r["output_tokens_actual"] or 0) > 1]), "{:16.1f}")
+row("vLLM preemptions (window)", lambda n: W[n]["preempt"], "{:16.0f}")
 row("L1 on-demand eviction", lambda n: str(W[n].get("od", "-")), "{:>16}")
 row("stores dropped (L1 full, end)", lambda n: str(W[n].get("oom", "-")), "{:>16}")
 row("L1 usage at end", lambda n: ("%.2f" % W[n]["l1_use"]) if "l1_use" in W[n] else "-", "{:>16}")
