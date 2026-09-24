@@ -12,6 +12,9 @@ denominator). Needs vLLM's --enable-prompt-tokens-details for per-request
 cached tokens.
 Per-request `cached_tokens` = GPU + L1 hits together; the split comes from
 the vLLM counters over the same window (30 s snapshots, nearest after).
+vllm:prompt_tokens_cached is local + external (L1-loaded) tokens, so GPU hits
+= cached - external_prefix_cache_hits and overall = cached. (external hits are
+also re-recorded when a preempted request is rescheduled; preemptions are few.)
 """
 import csv, json, os, re, statistics as st, sys
 csv.field_size_limit(10**9)
@@ -63,7 +66,7 @@ for name, d in arms:
         st_.update(ev=stored - l1["total_object_count"], trig=trig, turn=(stored - l1["total_object_count"]) / cap)
     except Exception:
         pass
-    W[name] = dict(win_s=t_end - t0, gpu=100 * g / p, l1=100 * e / p, all=100 * (g + e) / p,
+    W[name] = dict(win_s=t_end - t0, gpu=100 * (g - e) / p, l1=100 * e / p, all=100 * g / p,
                    preempt=dd("vllm:num_preemptions_total"), elapsed_s=elapsed, **st_)
 
 key = lambda r: (r["trace_id"], r["request_idx"])
