@@ -24,6 +24,8 @@ replayed (--keep-tails replays the later turns too; they can run ~1 h past a
 short window). The sampled set is fixed by --seed, so every arm
 replays exactly the same requests (fixed workload); the run ends when all of
 them completed (or --deadline-s).
+--unshare salts every conversation's token ids with its root chat_id, so no two
+conversations share a prefix (the no-sharing control; same lengths and times).
 Routing: --dp-affinity N pins a request with X-data-parallel-rank = crc32(key)
 % N; key = root chat_id (--sticky-key conversation) or, for --sticky-key
 prefix, the first --prefix-blocks hash_ids when the prompt has that many blocks
@@ -56,9 +58,9 @@ def block_tokens(hash_id: int, salt: int) -> list:
 def build_prompt(rec: dict, salt: int, cache: dict) -> list:
     toks = []
     for h in rec["hash_ids"]:
-        b = cache.get(h)
+        b = cache.get((h, salt))
         if b is None:
-            b = cache[h] = block_tokens(h, salt)
+            b = cache[(h, salt)] = block_tokens(h, salt)
         toks.extend(b)
     n = max(1, min(rec["input_length"], len(toks)))
     return toks[:n]
@@ -129,7 +131,10 @@ class Replayer:
         return row
 
     async def one(self, session, rec, root_id, t_sched):
-        prompt = build_prompt(rec, self.salt, self.block_cache)
+        # --unshare: salt by conversation, so conversations share no prefix
+        # (same lengths and arrivals; reuse inside a conversation is kept)
+        salt = self.salt ^ zlib.crc32(str(root_id).encode()) if self.a.unshare else self.salt
+        prompt = build_prompt(rec, salt, self.block_cache)
         out_len = max(1, min(rec["output_length"], self.a.max_output_tokens))
         body = {"model": self.a.model, "prompt": prompt, "max_tokens": out_len,
                 "min_tokens": out_len, "ignore_eos": True, "temperature": 0.0,
@@ -309,6 +314,8 @@ def main():
     p.add_argument("--deadline-s", type=float, default=5400.0)
     p.add_argument("--request-timeout-s", type=float, default=1800.0)
     p.add_argument("--output-dir", default=".")
+    p.add_argument("--unshare", action="store_true",
+                   help="remove prefix sharing between conversations (token ids salted by root chat_id)")
     p.add_argument("--dry-run", action="store_true", help="print the sample size and offered load, send nothing")
     asyncio.run(Replayer(p.parse_args()).run())
 
